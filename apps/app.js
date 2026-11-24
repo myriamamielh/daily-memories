@@ -1,7 +1,7 @@
 // ============================================================================
 // CONFIGURATION — Replace with your Google Cloud OAuth 2.0 Client ID
 // ============================================================================
-const CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
+const CLIENT_ID = "402006802634-ic218vn97iho61k7b511g2eicl4noa6q.apps.googleusercontent.com";
 const SCOPES = "https://www.googleapis.com/auth/drive.readonly";
 
 // Storage Keys (Only stores folder ID and today's shown file IDs)
