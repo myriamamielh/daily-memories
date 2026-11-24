@@ -6,6 +6,21 @@
   const SCOPES = 'https://www.googleapis.com/auth/drive.readonly';
   const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3/files';
 
+  // Folders whose subtrees are excluded from photo/video memory scanning
+  const EXCLUDED_FOLDER_NAMES = [
+    'Created content',
+    'Audio tracks'
+  ];
+
+  // Folder names whose audio files are collected into the background audio pool
+  const AUDIO_FOLDER_NAMES = [
+    'Audio tracks'
+  ];
+
+  const IGNORED_EXTENSIONS = new Set([
+    'mepj'
+  ]);
+
   const PHOTO_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'heic']);
   const VIDEO_EXTENSIONS = new Set([
     'mp4',
@@ -18,6 +33,15 @@
     'wmv',
     'flv'
   ]);
+  const AUDIO_EXTENSIONS = new Set([
+    'mp3',
+    'm4a',
+    'aac',
+    'wav',
+    'ogg',
+    'flac',
+    'wma'
+  ]);
 
   const STORAGE_KEYS = {
     RECENT_SURPRISE: 'dm_recent_surprise_ids_v1'
@@ -28,16 +52,26 @@
     tokenClient: null,
     allPhotos: [],
     allVideos: [],
+    allAudioTracks: [],
     dailyPhotos: [],
     dailyVideo: null,
     currentSlideIndex: 0,
     slideTimer: null,
-    objectUrls: new Set()
+    objectUrls: new Set(),
+    audioElement: new Audio(),
+    currentAudioTrack: null,
+    isAudioPlaying: false
   };
+
+  state.audioElement.loop = false;
 
   // DOM References
   const dom = {
     headerActions: document.getElementById('header-actions'),
+    audioToggleBtn: document.getElementById('audio-toggle-btn'),
+    audioNextBtn: document.getElementById('audio-next-btn'),
+    audioIcon: document.getElementById('audio-icon'),
+    audioTrackLabel: document.getElementById('audio-track-label'),
     signOutBtn: document.getElementById('sign-out-btn'),
 
     authView: document.getElementById('auth-view'),
@@ -69,6 +103,21 @@
     closeModalBtn: document.getElementById('close-modal-btn'),
     modalBody: document.getElementById('modal-body')
   };
+
+  function isExcludedFolderName(name) {
+    const normalized = (name || '').trim().toLowerCase();
+    return EXCLUDED_FOLDER_NAMES.some((entry) => entry.trim().toLowerCase() === normalized);
+  }
+
+  function isAudioFolderName(name) {
+    const normalized = (name || '').trim().toLowerCase();
+    return AUDIO_FOLDER_NAMES.some((entry) => entry.trim().toLowerCase() === normalized);
+  }
+
+  function getFileExtension(fileName) {
+    const lower = (fileName || '').toLowerCase();
+    return lower.includes('.') ? lower.split('.').pop() : '';
+  }
 
   // View Switcher
   function showView(viewName) {
@@ -179,8 +228,17 @@
     state.tokenClient.requestAccessToken({ prompt: '' });
   }
 
+  function stopAudioPlayback() {
+    state.audioElement.pause();
+    state.audioElement.removeAttribute('src');
+    state.currentAudioTrack = null;
+    state.isAudioPlaying = false;
+    updateAudioControlsUi();
+  }
+
   function signOut() {
     stopSlideshowTimer();
+    stopAudioPlayback();
     revokeAllObjectUrls();
     if (state.accessToken && window.google && window.google.accounts) {
       window.google.accounts.oauth2.revoke(state.accessToken, () => {});
@@ -188,6 +246,7 @@
     state.accessToken = null;
     state.allPhotos = [];
     state.allVideos = [];
+    state.allAudioTracks = [];
     state.dailyPhotos = [];
     state.dailyVideo = null;
     showView('auth');
@@ -238,11 +297,22 @@
     state.objectUrls.clear();
   }
 
-  // Recursive Folder Scanner for Hardcoded Family Archive
-  function classifyMediaFile(file) {
-    const name = (file.name || '').toLowerCase();
+  // Media Classification
+  function classifyMediaFile(file, insideAudioFolder) {
+    const ext = getFileExtension(file.name);
+    if (IGNORED_EXTENSIONS.has(ext)) {
+      return null;
+    }
+
     const mime = (file.mimeType || '').toLowerCase();
-    const ext = name.includes('.') ? name.split('.').pop() : '';
+
+    if (insideAudioFolder && (AUDIO_EXTENSIONS.has(ext) || mime.startsWith('audio/'))) {
+      return { type: 'audio', isHeic: false };
+    }
+
+    if (insideAudioFolder) {
+      return null;
+    }
 
     if (ext === 'heic' || mime === 'image/heic' || mime === 'image/heif') {
       return { type: 'photo', isHeic: true };
@@ -290,24 +360,37 @@
   async function scanFolderRecursively(rootFolderId) {
     const photos = [];
     const videos = [];
+    const audioTracks = [];
     const visited = new Set([rootFolderId]);
-    const queue = [rootFolderId];
+    const queue = [{ id: rootFolderId, insideAudioFolder: false }];
     let scannedFolders = 0;
 
     while (queue.length > 0) {
-      const currentId = queue.shift();
+      const current = queue.shift();
       scannedFolders += 1;
-      dom.loadingStatus.textContent = `Scanned ${scannedFolders} folder${scannedFolders === 1 ? '' : 's'} • Found ${photos.length} photos & ${videos.length} videos`;
+      dom.loadingStatus.textContent = `Scanned ${scannedFolders} folder${scannedFolders === 1 ? '' : 's'} • ${photos.length} photos, ${videos.length} videos, ${audioTracks.length} audio tracks`;
 
-      const children = await listChildrenOfFolder(currentId);
+      const children = await listChildrenOfFolder(current.id);
       for (const item of children) {
         if (item.mimeType === 'application/vnd.google-apps.folder') {
-          if (!visited.has(item.id)) {
-            visited.add(item.id);
-            queue.push(item.id);
+          if (visited.has(item.id)) {
+            continue;
           }
+
+          if (isAudioFolderName(item.name)) {
+            visited.add(item.id);
+            queue.push({ id: item.id, insideAudioFolder: true });
+            continue;
+          }
+
+          if (isExcludedFolderName(item.name)) {
+            continue;
+          }
+
+          visited.add(item.id);
+          queue.push({ id: item.id, insideAudioFolder: current.insideAudioFolder });
         } else {
-          const mediaInfo = classifyMediaFile(item);
+          const mediaInfo = classifyMediaFile(item, current.insideAudioFolder);
           if (mediaInfo) {
             const enriched = {
               ...item,
@@ -317,19 +400,21 @@
             };
             if (mediaInfo.type === 'photo') {
               photos.push(enriched);
-            } else {
+            } else if (mediaInfo.type === 'video') {
               videos.push(enriched);
+            } else if (mediaInfo.type === 'audio') {
+              audioTracks.push(enriched);
             }
           }
         }
       }
     }
 
-    // Sort deterministically by ID before daily seeded selection
     photos.sort((a, b) => a.id.localeCompare(b.id));
     videos.sort((a, b) => a.id.localeCompare(b.id));
+    audioTracks.sort((a, b) => a.id.localeCompare(b.id));
 
-    return { photos, videos };
+    return { photos, videos, audioTracks };
   }
 
   async function loadFamilyArchive() {
@@ -338,13 +423,15 @@
     dom.loadingStatus.textContent = 'Scanning family archive...';
 
     try {
-      const { photos, videos } = await scanFolderRecursively(FAMILY_FOLDER_ID);
+      const { photos, videos, audioTracks } = await scanFolderRecursively(FAMILY_FOLDER_ID);
       state.allPhotos = photos;
       state.allVideos = videos;
+      state.allAudioTracks = audioTracks;
 
       prepareDailyMemories();
       renderDashboard();
       showView('memories');
+      startRandomAudioTrack();
     } catch (err) {
       dom.loadingStatus.textContent = `Unable to load family archive: ${err.message}`;
     }
@@ -366,6 +453,76 @@
       `video:${FAMILY_FOLDER_ID}:${todayKey}`
     );
     state.dailyVideo = videoSelection.length ? videoSelection[0] : null;
+  }
+
+  // Random Audio Track Playback from "Audio tracks" folders
+  function updateAudioControlsUi() {
+    const hasAudio = state.allAudioTracks.length > 0;
+    dom.audioToggleBtn.hidden = !hasAudio;
+    dom.audioNextBtn.hidden = state.allAudioTracks.length <= 1;
+
+    if (!hasAudio) return;
+
+    const cleanName = state.currentAudioTrack
+      ? state.currentAudioTrack.name.replace(/\.[^/.]+$/, '')
+      : 'Audio';
+
+    dom.audioIcon.textContent = state.isAudioPlaying ? '🔊' : '🔇';
+    dom.audioTrackLabel.textContent = cleanName;
+    dom.audioToggleBtn.classList.toggle('playing', state.isAudioPlaying);
+  }
+
+  async function startRandomAudioTrack() {
+    if (!state.allAudioTracks.length) {
+      updateAudioControlsUi();
+      return;
+    }
+
+    let pool = state.allAudioTracks;
+    if (state.currentAudioTrack && state.allAudioTracks.length > 1) {
+      pool = state.allAudioTracks.filter((track) => track.id !== state.currentAudioTrack.id);
+    }
+
+    const chosen = pool[Math.floor(Math.random() * pool.length)];
+    state.currentAudioTrack = chosen;
+    updateAudioControlsUi();
+
+    try {
+      const blobUrl = await fetchAuthenticatedBlobUrl(chosen.id);
+      if (state.currentAudioTrack?.id !== chosen.id) return;
+
+      state.audioElement.src = blobUrl;
+      await state.audioElement.play();
+      state.isAudioPlaying = true;
+      updateAudioControlsUi();
+    } catch (err) {
+      // Mobile browsers may block autoplay before user interaction; keep track ready to play
+      state.isAudioPlaying = false;
+      updateAudioControlsUi();
+    }
+  }
+
+  async function toggleAudioPlayback() {
+    if (!state.allAudioTracks.length) return;
+
+    if (!state.currentAudioTrack || !state.audioElement.src) {
+      await startRandomAudioTrack();
+      return;
+    }
+
+    if (state.isAudioPlaying) {
+      state.audioElement.pause();
+      state.isAudioPlaying = false;
+      updateAudioControlsUi();
+    } else {
+      try {
+        await state.audioElement.play();
+        state.isAudioPlaying = true;
+      } catch (err) {
+        state.isAudioPlaying = false;
+      }
+      updateAudioControlsUi();
+    }
   }
 
   // HEIC Fallback Helper
@@ -435,14 +592,12 @@
     }
 
     state.dailyPhotos.forEach((photo, idx) => {
-      // Progress Segment
       const seg = document.createElement('div');
       seg.className = 'progress-segment';
       seg.innerHTML = '<div class="progress-fill"></div>';
       seg.addEventListener('click', () => goToSlide(idx));
       dom.slideshowProgress.appendChild(seg);
 
-      // Slide Container
       const slide = document.createElement('div');
       slide.className = 'slide-item';
       slide.innerHTML = '<div class="loader-inline">Loading memory...</div>';
@@ -470,7 +625,6 @@
       if (i < index) {
         seg.classList.add('completed');
       } else if (i === index) {
-        // Trigger reflow so animation restarts cleanly
         void seg.offsetWidth;
         seg.classList.add('active');
       }
@@ -515,12 +669,10 @@
     dom.noVideoState.hidden = true;
     dom.dailyVideoDate.textContent = state.dailyVideo.displayDate || 'Tap to play';
 
-    // Load large thumbnail
     if (state.dailyVideo.thumbnailLink) {
       const highResThumb = state.dailyVideo.thumbnailLink.replace(/=s\d+$/, '=s960');
       dom.dailyVideoThumb.src = highResThumb;
     } else {
-      // Fallback: grab first frame via blob URL
       try {
         const videoBlobUrl = await fetchAuthenticatedBlobUrl(state.dailyVideo.id);
         const tempVideo = document.createElement('video');
@@ -593,6 +745,12 @@
     const { isSurprise = false } = options;
     stopSlideshowTimer();
 
+    if (file.mediaType === 'video' && state.isAudioPlaying) {
+      state.audioElement.pause();
+      state.isAudioPlaying = false;
+      updateAudioControlsUi();
+    }
+
     dom.modalBadge.textContent = isSurprise ? '🎲 Surprise Memory' : 'Featured Video';
     dom.modalDate.textContent = file.displayDate || '';
     dom.modalAnotherBtn.hidden = !isSurprise;
@@ -632,11 +790,16 @@
   function bindEvents() {
     dom.signInBtn.addEventListener('click', triggerSignIn);
     dom.signOutBtn.addEventListener('click', signOut);
+    dom.audioToggleBtn.addEventListener('click', toggleAudioPlayback);
+    dom.audioNextBtn.addEventListener('click', startRandomAudioTrack);
+
+    state.audioElement.addEventListener('ended', () => {
+      startRandomAudioTrack();
+    });
 
     dom.prevSlideBtn.addEventListener('click', () => goToSlide(state.currentSlideIndex - 1));
     dom.nextSlideBtn.addEventListener('click', () => goToSlide(state.currentSlideIndex + 1));
 
-    // Touch swipe support on slideshow
     let touchStartX = 0;
     dom.slideshowStage.addEventListener(
       'touchstart',
