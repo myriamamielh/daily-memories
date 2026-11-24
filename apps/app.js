@@ -1,20 +1,32 @@
 // ============================================================================
 // CONFIGURATION — Replace with your Google Cloud OAuth 2.0 Client ID
 // ============================================================================
-const CLIENT_ID = "402006802634-ic218vn97iho61k7b511g2eicl4noa6q.apps.googleusercontent.com";
+const CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
 const SCOPES = "https://www.googleapis.com/auth/drive.readonly";
 
-// Storage Keys (Only stores folder ID and today's shown file IDs)
+// Storage Keys (Only stores folder ID and today's chosen IDs — never media)
 const STORAGE_KEYS = {
   FOLDER_ID: "dm_shared_folder_id",
-  DAILY_STATE: "dm_daily_state_v1"
+  DAILY_STATE: "dm_daily_state_v2"
 };
+
+const SLIDE_INTERVAL_MS = 5000;
 
 // App State
 let tokenClient = null;
 let accessToken = null;
-let allFolderPhotos = []; // Array of { id, name, createdTime, imageMediaMetadata }
-let activeBlobUrls = [];  // Track blob URLs to revoke memory cleanly
+let allPhotos = [];
+let allVideos = [];
+let activeBlobUrls = [];
+
+// Slideshow State
+let slideEntries = []; // { file, blobUrl, isHeicUnsupported }
+let currentSlideIndex = 0;
+let slideshowTimer = null;
+
+// Daily Video State
+let dailyVideoFile = null;
+let dailyVideoThumbUrl = null;
 
 // DOM Elements
 const views = {
@@ -36,21 +48,33 @@ const els = {
   errorBanner: document.getElementById("error-banner"),
   errorMessage: document.getElementById("error-message"),
   retryBtn: document.getElementById("retry-btn"),
-  photosFeed: document.getElementById("photos-feed"),
-  controlsBar: document.getElementById("controls-bar"),
-  anotherBtn: document.getElementById("another-btn"),
-  remainingCount: document.getElementById("remaining-count"),
-  lightbox: document.getElementById("lightbox"),
-  lightboxImg: document.getElementById("lightbox-img"),
-  lightboxCaption: document.getElementById("lightbox-caption"),
-  lightboxClose: document.getElementById("lightbox-close")
+  stage: document.getElementById("stage"),
+  slideshowBox: document.getElementById("slideshow-box"),
+  slidesLayer: document.getElementById("slides-layer"),
+  heicBanner: document.getElementById("heic-banner"),
+  heicFilename: document.getElementById("heic-filename"),
+  slideCounter: document.getElementById("slide-counter"),
+  slideDate: document.getElementById("slide-date"),
+  videoSection: document.getElementById("video-section"),
+  videoPosterCard: document.getElementById("video-poster-card"),
+  videoThumbImg: document.getElementById("video-thumb-img"),
+  videoThumbFallback: document.getElementById("video-thumb-fallback"),
+  videoPlayTrigger: document.getElementById("video-play-trigger"),
+  videoTitle: document.getElementById("video-title"),
+  videoDate: document.getElementById("video-date"),
+  surpriseBtn: document.getElementById("surprise-btn"),
+  poolRemaining: document.getElementById("pool-remaining"),
+  modal: document.getElementById("media-modal"),
+  modalBadge: document.getElementById("modal-badge"),
+  modalBody: document.getElementById("modal-body"),
+  modalCaption: document.getElementById("modal-caption"),
+  modalClose: document.getElementById("modal-close")
 };
 
 // ============================================================================
-// INITIALIZATION
+// INITIALIZATION & AUTH (UNCHANGED)
 // ============================================================================
 document.addEventListener("DOMContentLoaded", () => {
-  // Display today's formatted date
   const now = new Date();
   els.dateSubtitle.textContent = now.toLocaleDateString(undefined, {
     weekday: "long",
@@ -58,7 +82,6 @@ document.addEventListener("DOMContentLoaded", () => {
     day: "numeric"
   });
 
-  // Wait for Google Identity Services script to load
   const waitForGIS = setInterval(() => {
     if (window.google && google.accounts && google.accounts.oauth2) {
       clearInterval(waitForGIS);
@@ -95,27 +118,28 @@ function bindEvents() {
     if (accessToken) {
       google.accounts.oauth2.revoke(accessToken, () => {});
     }
+    stopSlideshow();
+    cleanupStage();
     accessToken = null;
-    allFolderPhotos = [];
-    clearFeed();
+    allPhotos = [];
+    allVideos = [];
     els.signoutBtn.classList.add("hidden");
     switchView("auth");
   });
 
   els.saveFolderBtn.addEventListener("click", handleSaveFolder);
   els.changeFolderBtn.addEventListener("click", () => {
+    stopSlideshow();
     els.folderInput.value = localStorage.getItem(STORAGE_KEYS.FOLDER_ID) || "";
     switchView("setup");
   });
 
   els.retryBtn.addEventListener("click", () => loadDailyMemories());
-  els.anotherBtn.addEventListener("click", handleShowAnotherMemory);
+  els.videoPosterCard.addEventListener("click", () => openDailyVideoModal());
+  els.surpriseBtn.addEventListener("click", handleSurpriseMe);
 
-  // Lightbox events
-  els.lightboxClose.addEventListener("click", closeLightbox);
-  els.lightbox.addEventListener("click", (e) => {
-    if (e.target === els.lightbox) closeLightbox();
-  });
+  els.modalClose.addEventListener("click", closeModal);
+  els.modal.querySelector(".modal-backdrop").addEventListener("click", closeModal);
 }
 
 function switchView(viewName) {
@@ -124,15 +148,13 @@ function switchView(viewName) {
 }
 
 // ============================================================================
-// FOLDER SETUP & VALIDATION
+// FOLDER SETUP & VALIDATION (UNCHANGED)
 // ============================================================================
 function extractFolderId(input) {
   const trimmed = input.trim();
-  // Match URLs like https://drive.google.com/drive/folders/1a2B3c4D5e...
   const urlMatch = trimmed.match(/folders\/([a-zA-Z0-9_-]+)/);
   if (urlMatch && urlMatch[1]) return urlMatch[1];
 
-  // Match raw IDs
   const idMatch = trimmed.match(/^[a-zA-Z0-9_-]{15,}$/);
   if (idMatch) return trimmed;
 
@@ -151,7 +173,6 @@ function handleSaveFolder() {
   const previousFolderId = localStorage.getItem(STORAGE_KEYS.FOLDER_ID);
   localStorage.setItem(STORAGE_KEYS.FOLDER_ID, folderId);
 
-  // Reset daily tracking if user switched to a different folder
   if (previousFolderId !== folderId) {
     localStorage.removeItem(STORAGE_KEYS.DAILY_STATE);
   }
@@ -181,7 +202,6 @@ async function driveFetch(url, options = {}) {
   });
 
   if (res.status === 401) {
-    // Token expired; prompt refresh silently or interactively
     throw new Error("SESSION_EXPIRED");
   }
   if (!res.ok) {
@@ -192,10 +212,11 @@ async function driveFetch(url, options = {}) {
 }
 
 /**
- * Recursively collects all image files inside the shared folder and any subfolders.
+ * Recursively collects all image and video files inside the shared folder & subfolders.
  */
-async function fetchAllPhotosInFolder(rootFolderId) {
+async function fetchMediaInFolder(rootFolderId) {
   const photos = [];
+  const videos = [];
   const foldersToScan = [rootFolderId];
   const scannedFolders = new Set();
 
@@ -207,10 +228,10 @@ async function fetchAllPhotosInFolder(rootFolderId) {
     let pageToken = null;
     do {
       const q = encodeURIComponent(
-        `'${currentFolderId}' in parents and trashed = false and (mimeType contains 'image/' or mimeType = 'application/vnd.google-apps.folder')`
+        `'${currentFolderId}' in parents and trashed = false and (mimeType contains 'image/' or mimeType contains 'video/' or mimeType = 'application/vnd.google-apps.folder')`
       );
       const fields = encodeURIComponent(
-        "nextPageToken, files(id, name, mimeType, createdTime, imageMediaMetadata(time))"
+        "nextPageToken, files(id, name, mimeType, createdTime, thumbnailLink, imageMediaMetadata(time))"
       );
       let url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=${fields}&pageSize=1000&includeItemsFromAllDrives=true&supportsAllDrives=true`;
       if (pageToken) url += `&pageToken=${pageToken}`;
@@ -223,17 +244,42 @@ async function fetchAllPhotosInFolder(rootFolderId) {
           foldersToScan.push(file.id);
         } else if (file.mimeType.startsWith("image/")) {
           photos.push(file);
+        } else if (file.mimeType.startsWith("video/")) {
+          videos.push(file);
         }
       }
       pageToken = data.nextPageToken;
     } while (pageToken);
   }
 
-  return photos;
+  return { photos, videos };
+}
+
+function trackBlobUrl(url) {
+  activeBlobUrls.push(url);
+  return url;
+}
+
+async function fetchMediaBlobUrl(fileId) {
+  const mediaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
+  const res = await driveFetch(mediaUrl);
+  const blob = await res.blob();
+  return trackBlobUrl(URL.createObjectURL(blob));
+}
+
+async function fetchThumbnailBlobUrl(file) {
+  if (!file.thumbnailLink) return null;
+  try {
+    const res = await driveFetch(file.thumbnailLink);
+    const blob = await res.blob();
+    return trackBlobUrl(URL.createObjectURL(blob));
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================================
-// DAILY SELECTION & DEDUPLICATION LOGIC
+// DAILY SELECTION & PERSISTENCE (5 PHOTOS + 1 VIDEO PER DAY)
 // ============================================================================
 function getTodayKey() {
   const d = new Date();
@@ -246,14 +292,23 @@ function getDailyState() {
     const raw = localStorage.getItem(STORAGE_KEYS.DAILY_STATE);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed.date === today && Array.isArray(parsed.shownIds)) {
+      if (
+        parsed.date === today &&
+        Array.isArray(parsed.photoIds) &&
+        Array.isArray(parsed.shownIds)
+      ) {
         return parsed;
       }
     }
-  } catch (e) {
-    // Ignore storage parse errors
+  } catch {
+    // Ignore storage errors
   }
-  return { date: today, shownIds: [], todaysBatchIds: [] };
+  return {
+    date: today,
+    photoIds: [],
+    videoId: null,
+    shownIds: []
+  };
 }
 
 function saveDailyState(state) {
@@ -270,53 +325,80 @@ function pickRandomItems(array, count) {
 }
 
 // ============================================================================
-// RENDERING MEMORIES
+// LOADING & RENDERING DAILY MEMORIES
 // ============================================================================
 async function loadDailyMemories() {
   switchView("memories");
-  clearFeed();
+  stopSlideshow();
+  cleanupStage();
   els.errorBanner.classList.add("hidden");
-  els.controlsBar.classList.add("hidden");
+  els.stage.classList.add("hidden");
   els.loader.classList.remove("hidden");
 
   const folderId = localStorage.getItem(STORAGE_KEYS.FOLDER_ID);
 
   try {
-    allFolderPhotos = await fetchAllPhotosInFolder(folderId);
+    const { photos, videos } = await fetchMediaInFolder(folderId);
+    allPhotos = photos;
+    allVideos = videos;
 
-    if (allFolderPhotos.length === 0) {
-      throw new Error("No images were found in this folder. Make sure the folder is shared with your Google account.");
+    if (allPhotos.length === 0 && allVideos.length === 0) {
+      throw new Error("No photos or videos were found in this folder.");
     }
 
-    els.poolStatus.textContent = `${allFolderPhotos.length} photos in shared folder`;
+    els.poolStatus.textContent = `${allPhotos.length} photos · ${allVideos.length} videos`;
 
     const state = getDailyState();
-    const photoMap = new Map(allFolderPhotos.map((p) => [p.id, p]));
+    const photoMap = new Map(allPhotos.map((p) => [p.id, p]));
+    const videoMap = new Map(allVideos.map((v) => [v.id, v]));
 
-    // Check if we already picked today's 5 photos earlier today
-    let photosToDisplay = state.todaysBatchIds
-      .map((id) => photoMap.get(id))
-      .filter(Boolean);
-
-    // If it's a new day (or first visit today), pick 5 random photos
-    if (photosToDisplay.length === 0) {
-      const unseen = allFolderPhotos.filter((p) => !state.shownIds.includes(p.id));
-      const pool = unseen.length > 0 ? unseen : allFolderPhotos;
-      photosToDisplay = pickRandomItems(pool, 5);
-
-      state.todaysBatchIds = photosToDisplay.map((p) => p.id);
-      state.shownIds = Array.from(new Set([...state.shownIds, ...state.todaysBatchIds]));
-      saveDailyState(state);
+    // Restore or pick today's 5 photos
+    let dailyPhotos = state.photoIds.map((id) => photoMap.get(id)).filter(Boolean);
+    if (dailyPhotos.length === 0 && allPhotos.length > 0) {
+      const unseenPhotos = allPhotos.filter((p) => !state.shownIds.includes(p.id));
+      const pool = unseenPhotos.length > 0 ? unseenPhotos : allPhotos;
+      dailyPhotos = pickRandomItems(pool, Math.min(5, pool.length));
+      state.photoIds = dailyPhotos.map((p) => p.id);
     }
+
+    // Restore or pick today's 1 video
+    let dailyVideo = state.videoId ? videoMap.get(state.videoId) : null;
+    if (!dailyVideo && allVideos.length > 0) {
+      const unseenVideos = allVideos.filter((v) => !state.shownIds.includes(v.id));
+      const vPool = unseenVideos.length > 0 ? unseenVideos : allVideos;
+      [dailyVideo] = pickRandomItems(vPool, 1);
+      state.videoId = dailyVideo ? dailyVideo.id : null;
+    }
+
+    // Mark today's selected photo & video IDs as shown today
+    const idsToMark = [
+      ...dailyPhotos.map((p) => p.id),
+      ...(dailyVideo ? [dailyVideo.id] : [])
+    ];
+    state.shownIds = Array.from(new Set([...state.shownIds, ...idsToMark]));
+    saveDailyState(state);
+
+    // Prepare slideshow entries (attempting HEIC in browser; compact fallback if unsupported)
+    slideEntries = [];
+    for (const photo of dailyPhotos) {
+      const entry = await buildSlideEntry(photo);
+      slideEntries.push(entry);
+    }
+
+    renderSlideshowDom();
+    await renderDailyVideoSection(dailyVideo);
+    updateSurpriseHint();
 
     els.loader.classList.add("hidden");
+    els.stage.classList.remove("hidden");
 
-    for (const photo of photosToDisplay) {
-      await appendPhotoCard(photo);
+    if (slideEntries.length > 0) {
+      currentSlideIndex = 0;
+      activateSlide(0);
+      startSlideshow();
+    } else {
+      els.slideshowBox.classList.add("hidden");
     }
-
-    updateControlsUI();
-    els.controlsBar.classList.remove("hidden");
   } catch (err) {
     els.loader.classList.add("hidden");
     if (err.message === "SESSION_EXPIRED") {
@@ -327,133 +409,108 @@ async function loadDailyMemories() {
   }
 }
 
-async function handleShowAnotherMemory() {
-  const state = getDailyState();
-  const unseenPhotos = allFolderPhotos.filter((p) => !state.shownIds.includes(p.id));
+function isHeicFile(file) {
+  const mime = (file.mimeType || "").toLowerCase();
+  const name = (file.name || "").toLowerCase();
+  return mime.includes("heic") || mime.includes("heif") || name.endsWith(".heic") || name.endsWith(".heif");
+}
 
-  if (unseenPhotos.length === 0) {
-    updateControlsUI();
-    return;
-  }
-
-  els.anotherBtn.disabled = true;
-  els.anotherBtn.textContent = "Loading memory...";
-
+/**
+ * Attempts to load image in browser (including HEIC on Safari/iOS).
+ * Marks isHeicUnsupported = true if decoding fails so we show a compact ~150px placeholder.
+ */
+async function buildSlideEntry(file) {
   try {
-    const [nextPhoto] = pickRandomItems(unseenPhotos, 1);
+    const blobUrl = await fetchMediaBlobUrl(file.id);
+    const canDecode = await testImageCanDecode(blobUrl);
 
-    state.todaysBatchIds.push(nextPhoto.id);
-    state.shownIds.push(nextPhoto.id);
-    saveDailyState(state);
-
-    await appendPhotoCard(nextPhoto, true);
-  } catch (err) {
-    if (err.message === "SESSION_EXPIRED") {
-      tokenClient.requestAccessToken({ prompt: "" });
-    } else {
-      showError("Could not load another photo: " + err.message);
+    if (!canDecode && isHeicFile(file)) {
+      return { file, blobUrl: null, isHeicUnsupported: true };
     }
-  } finally {
-    els.anotherBtn.disabled = false;
-    els.anotherBtn.textContent = "✨ Show me another memory";
-    updateControlsUI();
+    return { file, blobUrl, isHeicUnsupported: false };
+  } catch {
+    if (isHeicFile(file)) {
+      return { file, blobUrl: null, isHeicUnsupported: true };
+    }
+    return { file, blobUrl: null, isHeicUnsupported: false };
   }
 }
 
-async function appendPhotoCard(file, scrollIntoView = false) {
-  // Fetch image binary directly from Google Drive API using OAuth token
-  const mediaUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&supportsAllDrives=true`;
-  const res = await driveFetch(mediaUrl);
-  const blob = await res.blob();
-  const objectUrl = URL.createObjectURL(blob);
-  activeBlobUrls.push(objectUrl);
+function testImageCanDecode(url) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img.naturalWidth > 0);
+    img.onerror = () => resolve(false);
+    img.src = url;
+  });
+}
 
-  // Format EXIF capture date or Drive upload date
-  const rawDate = file.imageMediaMetadata?.time || file.createdTime;
-  const formattedDate = formatPhotoDate(rawDate);
+function renderSlideshowDom() {
+  els.slidesLayer.innerHTML = "";
 
-  const card = document.createElement("article");
-  card.className = "photo-card";
-  card.innerHTML = `
-    <div class="photo-wrapper">
-      <img src="${objectUrl}" alt="${escapeHtml(file.name)}" loading="lazy" />
-    </div>
-    <div class="photo-meta">
-      <span class="photo-date">${formattedDate}</span>
-      <span>Tap to expand</span>
-    </div>
-  `;
+  slideEntries.forEach((entry, idx) => {
+    const slideEl = document.createElement("div");
+    slideEl.className = "slide";
+    slideEl.dataset.index = String(idx);
 
-  card.querySelector("img").addEventListener("click", () => {
-    openLightbox(objectUrl, `${formattedDate} — ${file.name}`);
+    if (entry.blobUrl && !entry.isHeicUnsupported) {
+      const img = document.createElement("img");
+      img.src = entry.blobUrl;
+      img.alt = entry.file.name;
+      slideEl.appendChild(img);
+    }
+
+    els.slidesLayer.appendChild(slideEl);
+  });
+}
+
+function activateSlide(index) {
+  if (slideEntries.length === 0) return;
+  currentSlideIndex = index % slideEntries.length;
+  const entry = slideEntries[currentSlideIndex];
+
+  const allSlideEls = els.slidesLayer.querySelectorAll(".slide");
+  allSlideEls.forEach((el, i) => {
+    const isCurrent = i === currentSlideIndex;
+    el.classList.toggle("active", isCurrent);
+    el.classList.remove("ken-burns");
+    if (isCurrent && !entry.isHeicUnsupported) {
+      // Trigger reflow so Ken Burns restarts cleanly on each slide
+      void el.offsetWidth;
+      el.classList.add("ken-burns");
+    }
   });
 
-  els.photosFeed.appendChild(card);
-
-  if (scrollIntoView) {
-    card.scrollIntoView({ behavior: "smooth", block: "center" });
-  }
-}
-
-function updateControlsUI() {
-  const state = getDailyState();
-  const remaining = allFolderPhotos.filter((p) => !state.shownIds.includes(p.id)).length;
-
-  if (remaining === 0) {
-    els.anotherBtn.disabled = true;
-    els.anotherBtn.textContent = "All photos shown for today 🎉";
-    els.remainingCount.textContent = "Come back tomorrow for a fresh set of memories.";
+  if (entry.isHeicUnsupported) {
+    els.heicFilename.textContent = entry.file.name;
+    els.heicBanner.classList.remove("hidden");
   } else {
-    els.anotherBtn.disabled = false;
-    els.remainingCount.textContent = `${remaining} unseen ${remaining === 1 ? "photo" : "photos"} left today`;
+    els.heicBanner.classList.add("hidden");
+  }
+
+  els.slideCounter.textContent = `${currentSlideIndex + 1} / ${slideEntries.length}`;
+  els.slideDate.textContent = formatPhotoDate(
+    entry.file.imageMediaMetadata?.time || entry.file.createdTime
+  );
+}
+
+function startSlideshow() {
+  stopSlideshow();
+  if (slideEntries.length <= 1) return;
+  slideshowTimer = setInterval(() => {
+    activateSlide((currentSlideIndex + 1) % slideEntries.length);
+  }, SLIDE_INTERVAL_MS);
+}
+
+function stopSlideshow() {
+  if (slideshowTimer) {
+    clearInterval(slideshowTimer);
+    slideshowTimer = null;
   }
 }
 
-function clearFeed() {
-  els.photosFeed.innerHTML = "";
-  activeBlobUrls.forEach((url) => URL.revokeObjectURL(url));
-  activeBlobUrls = [];
-}
-
-function showError(msg) {
-  els.errorMessage.textContent = msg;
-  els.errorBanner.classList.remove("hidden");
-}
-
 // ============================================================================
-// HELPERS & LIGHTBOX
+// DAILY VIDEO SECTION (BELOW SLIDESHOW, NO AUTOPLAY)
 // ============================================================================
-function formatPhotoDate(dateStr) {
-  if (!dateStr) return "Shared Memory";
-  // EXIF timestamps often use "YYYY:MM:DD HH:MM:SS"
-  const normalized = dateStr.replace(/^(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3");
-  const date = new Date(normalized);
-  if (isNaN(date.getTime())) return "Shared Memory";
-
-  return date.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric"
-  });
-}
-
-function escapeHtml(str) {
-  return str.replace(/[&<>"']/g, (m) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
-  }[m]));
-}
-
-function openLightbox(src, caption) {
-  els.lightboxImg.src = src;
-  els.lightboxCaption.textContent = caption;
-  els.lightbox.classList.remove("hidden");
-}
-
-function closeLightbox() {
-  els.lightbox.classList.add("hidden");
-  els.lightboxImg.src = "";
-}
+async function renderDailyVideoSection(videoFile) {
+  dailyVideoFile = video
