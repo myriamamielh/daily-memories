@@ -1,10 +1,6 @@
-// ============================================================================
-// CONFIGURATION — Replace with your Google Cloud OAuth 2.0 Client ID
-// ============================================================================
-const CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
+const CLIENT_ID = "402006802634-ic218vn97iho61k7b511g2eicl4noa6q.apps.googleusercontent.com";
 const SCOPES = "https://www.googleapis.com/auth/drive.readonly";
 
-// Storage Keys (Only stores folder ID and today's chosen IDs — never media)
 const STORAGE_KEYS = {
   FOLDER_ID: "dm_shared_folder_id",
   DAILY_STATE: "dm_daily_state_v2"
@@ -12,23 +8,19 @@ const STORAGE_KEYS = {
 
 const SLIDE_INTERVAL_MS = 5000;
 
-// App State
 let tokenClient = null;
 let accessToken = null;
 let allPhotos = [];
 let allVideos = [];
 let activeBlobUrls = [];
 
-// Slideshow State
-let slideEntries = []; // { file, blobUrl, isHeicUnsupported }
+let slideEntries = [];
 let currentSlideIndex = 0;
 let slideshowTimer = null;
 
-// Daily Video State
 let dailyVideoFile = null;
 let dailyVideoThumbUrl = null;
 
-// DOM Elements
 const views = {
   auth: document.getElementById("auth-view"),
   setup: document.getElementById("setup-view"),
@@ -71,9 +63,6 @@ const els = {
   modalClose: document.getElementById("modal-close")
 };
 
-// ============================================================================
-// INITIALIZATION & AUTH (UNCHANGED)
-// ============================================================================
 document.addEventListener("DOMContentLoaded", () => {
   const now = new Date();
   els.dateSubtitle.textContent = now.toLocaleDateString(undefined, {
@@ -147,9 +136,6 @@ function switchView(viewName) {
   views[viewName].classList.add("active");
 }
 
-// ============================================================================
-// FOLDER SETUP & VALIDATION (UNCHANGED)
-// ============================================================================
 function extractFolderId(input) {
   const trimmed = input.trim();
   const urlMatch = trimmed.match(/folders\/([a-zA-Z0-9_-]+)/);
@@ -189,9 +175,6 @@ function onAuthenticated() {
   }
 }
 
-// ============================================================================
-// GOOGLE DRIVE API FETCHING
-// ============================================================================
 async function driveFetch(url, options = {}) {
   const res = await fetch(url, {
     ...options,
@@ -211,9 +194,6 @@ async function driveFetch(url, options = {}) {
   return res;
 }
 
-/**
- * Recursively collects all image and video files inside the shared folder & subfolders.
- */
 async function fetchMediaInFolder(rootFolderId) {
   const photos = [];
   const videos = [];
@@ -278,9 +258,6 @@ async function fetchThumbnailBlobUrl(file) {
   }
 }
 
-// ============================================================================
-// DAILY SELECTION & PERSISTENCE (5 PHOTOS + 1 VIDEO PER DAY)
-// ============================================================================
 function getTodayKey() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -324,9 +301,6 @@ function pickRandomItems(array, count) {
   return copy.slice(0, count);
 }
 
-// ============================================================================
-// LOADING & RENDERING DAILY MEMORIES
-// ============================================================================
 async function loadDailyMemories() {
   switchView("memories");
   stopSlideshow();
@@ -352,7 +326,6 @@ async function loadDailyMemories() {
     const photoMap = new Map(allPhotos.map((p) => [p.id, p]));
     const videoMap = new Map(allVideos.map((v) => [v.id, v]));
 
-    // Restore or pick today's 5 photos
     let dailyPhotos = state.photoIds.map((id) => photoMap.get(id)).filter(Boolean);
     if (dailyPhotos.length === 0 && allPhotos.length > 0) {
       const unseenPhotos = allPhotos.filter((p) => !state.shownIds.includes(p.id));
@@ -361,7 +334,6 @@ async function loadDailyMemories() {
       state.photoIds = dailyPhotos.map((p) => p.id);
     }
 
-    // Restore or pick today's 1 video
     let dailyVideo = state.videoId ? videoMap.get(state.videoId) : null;
     if (!dailyVideo && allVideos.length > 0) {
       const unseenVideos = allVideos.filter((v) => !state.shownIds.includes(v.id));
@@ -370,7 +342,6 @@ async function loadDailyMemories() {
       state.videoId = dailyVideo ? dailyVideo.id : null;
     }
 
-    // Mark today's selected photo & video IDs as shown today
     const idsToMark = [
       ...dailyPhotos.map((p) => p.id),
       ...(dailyVideo ? [dailyVideo.id] : [])
@@ -378,7 +349,6 @@ async function loadDailyMemories() {
     state.shownIds = Array.from(new Set([...state.shownIds, ...idsToMark]));
     saveDailyState(state);
 
-    // Prepare slideshow entries (attempting HEIC in browser; compact fallback if unsupported)
     slideEntries = [];
     for (const photo of dailyPhotos) {
       const entry = await buildSlideEntry(photo);
@@ -415,10 +385,6 @@ function isHeicFile(file) {
   return mime.includes("heic") || mime.includes("heif") || name.endsWith(".heic") || name.endsWith(".heif");
 }
 
-/**
- * Attempts to load image in browser (including HEIC on Safari/iOS).
- * Marks isHeicUnsupported = true if decoding fails so we show a compact ~150px placeholder.
- */
 async function buildSlideEntry(file) {
   try {
     const blobUrl = await fetchMediaBlobUrl(file.id);
@@ -475,7 +441,6 @@ function activateSlide(index) {
     el.classList.toggle("active", isCurrent);
     el.classList.remove("ken-burns");
     if (isCurrent && !entry.isHeicUnsupported) {
-      // Trigger reflow so Ken Burns restarts cleanly on each slide
       void el.offsetWidth;
       el.classList.add("ken-burns");
     }
@@ -509,8 +474,170 @@ function stopSlideshow() {
   }
 }
 
-// ============================================================================
-// DAILY VIDEO SECTION (BELOW SLIDESHOW, NO AUTOPLAY)
-// ============================================================================
 async function renderDailyVideoSection(videoFile) {
-  dailyVideoFile = video
+  dailyVideoFile = videoFile;
+  dailyVideoThumbUrl = null;
+
+  if (!videoFile) {
+    els.videoSection.classList.add("hidden");
+    return;
+  }
+
+  els.videoSection.classList.remove("hidden");
+  els.videoTitle.textContent = videoFile.name;
+  els.videoDate.textContent = formatPhotoDate(videoFile.createdTime);
+
+  const thumbUrl = await fetchThumbnailBlobUrl(videoFile);
+  if (thumbUrl) {
+    dailyVideoThumbUrl = thumbUrl;
+    els.videoThumbImg.src = thumbUrl;
+    els.videoThumbImg.classList.remove("hidden");
+    els.videoThumbFallback.classList.add("hidden");
+  } else {
+    els.videoThumbImg.classList.add("hidden");
+    els.videoThumbFallback.classList.remove("hidden");
+  }
+}
+
+async function openDailyVideoModal() {
+  if (!dailyVideoFile) return;
+
+  els.modalBadge.textContent = "Daily Video";
+  els.modalCaption.textContent = `${formatPhotoDate(dailyVideoFile.createdTime)} — ${dailyVideoFile.name}`;
+  els.modalBody.innerHTML = `<div class="spinner"></div>`;
+  els.modal.classList.remove("hidden");
+
+  try {
+    const videoUrl = await fetchMediaBlobUrl(dailyVideoFile.id);
+    els.modalBody.innerHTML = "";
+    const videoEl = document.createElement("video");
+    videoEl.src = videoUrl;
+    videoEl.controls = true;
+    videoEl.playsInline = true;
+    videoEl.preload = "metadata";
+    if (dailyVideoThumbUrl) {
+      videoEl.poster = dailyVideoThumbUrl;
+    }
+    videoEl.autoplay = false;
+    els.modalBody.appendChild(videoEl);
+  } catch (err) {
+    els.modalBody.innerHTML = `<p class="error-text" style="padding:16px;">Could not load video: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function handleSurpriseMe() {
+  const combined = [...allPhotos, ...allVideos];
+  if (combined.length === 0) return;
+
+  const state = getDailyState();
+  let candidates = combined.filter((item) => !state.shownIds.includes(item.id));
+  if (candidates.length === 0) {
+    candidates = combined;
+  }
+
+  const [picked] = pickRandomItems(candidates, 1);
+
+  if (!state.shownIds.includes(picked.id)) {
+    state.shownIds.push(picked.id);
+    saveDailyState(state);
+    updateSurpriseHint();
+  }
+
+  const isVideo = (picked.mimeType || "").startsWith("video/");
+  els.modalBadge.textContent = isVideo ? "🎲 Surprise Video" : "🎲 Surprise Photo";
+  els.modalCaption.textContent = `${formatPhotoDate(picked.imageMediaMetadata?.time || picked.createdTime)} — ${picked.name}`;
+  els.modalBody.innerHTML = `<div class="spinner"></div>`;
+  els.modal.classList.remove("hidden");
+
+  try {
+    const mediaUrl = await fetchMediaBlobUrl(picked.id);
+    els.modalBody.innerHTML = "";
+
+    if (isVideo) {
+      const videoEl = document.createElement("video");
+      videoEl.src = mediaUrl;
+      videoEl.controls = true;
+      videoEl.playsInline = true;
+      videoEl.preload = "metadata";
+      videoEl.autoplay = false;
+      els.modalBody.appendChild(videoEl);
+    } else {
+      const canDecode = await testImageCanDecode(mediaUrl);
+      if (!canDecode && isHeicFile(picked)) {
+        els.modalBody.innerHTML = `
+          <div class="modal-heic-card">
+            <span class="heic-icon">📱</span>
+            <div class="heic-copy">
+              <strong>HEIC image - view on iPhone</strong>
+              <span>${escapeHtml(picked.name)}</span>
+            </div>
+          </div>
+        `;
+      } else {
+        const imgEl = document.createElement("img");
+        imgEl.src = mediaUrl;
+        imgEl.alt = picked.name;
+        els.modalBody.appendChild(imgEl);
+      }
+    }
+  } catch (err) {
+    els.modalBody.innerHTML = `<p class="error-text" style="padding:16px;">Could not load memory: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function closeModal() {
+  const videoEl = els.modalBody.querySelector("video");
+  if (videoEl) {
+    videoEl.pause();
+    videoEl.removeAttribute("src");
+    videoEl.load();
+  }
+  els.modalBody.innerHTML = "";
+  els.modal.classList.add("hidden");
+}
+
+function updateSurpriseHint() {
+  const state = getDailyState();
+  const total = allPhotos.length + allVideos.length;
+  const unseen = Math.max(0, total - state.shownIds.length);
+  els.poolRemaining.textContent = `${unseen} unseen ${unseen === 1 ? "item" : "items"} remaining today`;
+}
+
+function cleanupStage() {
+  els.slidesLayer.innerHTML = "";
+  els.heicBanner.classList.add("hidden");
+  els.slideshowBox.classList.remove("hidden");
+  activeBlobUrls.forEach((url) => URL.revokeObjectURL(url));
+  activeBlobUrls = [];
+  slideEntries = [];
+  dailyVideoFile = null;
+  dailyVideoThumbUrl = null;
+}
+
+function showError(msg) {
+  els.errorMessage.textContent = msg;
+  els.errorBanner.classList.remove("hidden");
+}
+
+function formatPhotoDate(dateStr) {
+  if (!dateStr) return "Shared Memory";
+  const normalized = dateStr.replace(/^(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3");
+  const date = new Date(normalized);
+  if (isNaN(date.getTime())) return "Shared Memory";
+
+  return date.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric"
+  });
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (m) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[m]));
+}
