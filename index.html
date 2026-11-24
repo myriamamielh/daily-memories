@@ -21,6 +21,13 @@
         <h1>Daily Memories</h1>
       </div>
       <div class="header-actions" id="header-actions" hidden>
+        <button id="audio-toggle-btn" class="icon-btn" title="Toggle Audio" aria-label="Toggle Audio" hidden>
+          <span id="audio-icon">🎵</span>
+          <span class="btn-label" id="audio-track-label">Audio</span>
+        </button>
+        <button id="audio-next-btn" class="icon-btn" title="Next Audio Track" aria-label="Next Audio Track" hidden>
+          <span>⏭</span>
+        </button>
         <button id="sign-out-btn" class="icon-btn" title="Sign Out" aria-label="Sign Out">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
@@ -62,7 +69,7 @@
       <!-- Top Section: Full-Width Photo Slideshow -->
       <section class="slideshow-section" aria-label="Daily Photo Memories">
         <div class="progress-bars" id="slideshow-progress"></div>
-        
+
         <div id="slideshow-stage" class="slideshow-stage">
           <!-- Slides injected dynamically -->
         </div>
