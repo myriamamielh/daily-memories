@@ -1,643 +1,849 @@
-const CLIENT_ID = "402006802634-ic218vn97iho61k7b511g2eicl4noa6q.apps.googleusercontent.com";
-const SCOPES = "https://www.googleapis.com/auth/drive.readonly";
+(() => {
+  'use strict';
 
-const STORAGE_KEYS = {
-  FOLDER_ID: "dm_shared_folder_id",
-  DAILY_STATE: "dm_daily_state_v2"
-};
+  const CLIENT_ID = '402006802634-ic218vn97iho61k7b511g2eicl4noa6q.apps.googleusercontent.com';
+  const SCOPES = 'https://www.googleapis.com/auth/drive.readonly';
+  const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3/files';
 
-const SLIDE_INTERVAL_MS = 5000;
+  const PHOTO_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'heic']);
+  const VIDEO_EXTENSIONS = new Set([
+    'mp4',
+    'mov',
+    'm4v',
+    'webm',
+    'avi',
+    'mkv',
+    '3gp',
+    'wmv',
+    'flv'
+  ]);
 
-let tokenClient = null;
-let accessToken = null;
-let allPhotos = [];
-let allVideos = [];
-let activeBlobUrls = [];
+  const STORAGE_KEYS = {
+    FOLDER: 'dm_selected_folder_v1',
+    RECENT_SURPRISE: 'dm_recent_surprise_ids_v1'
+  };
 
-let slideEntries = [];
-let currentSlideIndex = 0;
-let slideshowTimer = null;
+  const state = {
+    accessToken: null,
+    tokenClient: null,
+    selectedFolder: null,
+    allPhotos: [],
+    allVideos: [],
+    dailyPhotos: [],
+    dailyVideo: null,
+    currentSlideIndex: 0,
+    slideTimer: null,
+    objectUrls: new Set()
+  };
 
-let dailyVideoFile = null;
-let dailyVideoThumbUrl = null;
+  // DOM References
+  const dom = {
+    headerActions: document.getElementById('header-actions'),
+    currentFolderLabel: document.getElementById('current-folder-label'),
+    changeFolderBtn: document.getElementById('change-folder-btn'),
+    signOutBtn: document.getElementById('sign-out-btn'),
 
-const views = {
-  auth: document.getElementById("auth-view"),
-  setup: document.getElementById("setup-view"),
-  memories: document.getElementById("memories-view")
-};
+    authView: document.getElementById('auth-view'),
+    signInBtn: document.getElementById('sign-in-btn'),
+    authError: document.getElementById('auth-error'),
 
-const els = {
-  dateSubtitle: document.getElementById("date-subtitle"),
-  signinBtn: document.getElementById("signin-btn"),
-  signoutBtn: document.getElementById("signout-btn"),
-  folderInput: document.getElementById("folder-input"),
-  saveFolderBtn: document.getElementById("save-folder-btn"),
-  setupError: document.getElementById("setup-error"),
-  changeFolderBtn: document.getElementById("change-folder-btn"),
-  poolStatus: document.getElementById("pool-status"),
-  loader: document.getElementById("loader"),
-  errorBanner: document.getElementById("error-banner"),
-  errorMessage: document.getElementById("error-message"),
-  retryBtn: document.getElementById("retry-btn"),
-  stage: document.getElementById("stage"),
-  slideshowBox: document.getElementById("slideshow-box"),
-  slidesLayer: document.getElementById("slides-layer"),
-  heicBanner: document.getElementById("heic-banner"),
-  heicFilename: document.getElementById("heic-filename"),
-  slideCounter: document.getElementById("slide-counter"),
-  slideDate: document.getElementById("slide-date"),
-  videoSection: document.getElementById("video-section"),
-  videoPosterCard: document.getElementById("video-poster-card"),
-  videoThumbImg: document.getElementById("video-thumb-img"),
-  videoThumbFallback: document.getElementById("video-thumb-fallback"),
-  videoPlayTrigger: document.getElementById("video-play-trigger"),
-  videoTitle: document.getElementById("video-title"),
-  videoDate: document.getElementById("video-date"),
-  surpriseBtn: document.getElementById("surprise-btn"),
-  poolRemaining: document.getElementById("pool-remaining"),
-  modal: document.getElementById("media-modal"),
-  modalBadge: document.getElementById("modal-badge"),
-  modalBody: document.getElementById("modal-body"),
-  modalCaption: document.getElementById("modal-caption"),
-  modalClose: document.getElementById("modal-close")
-};
+    folderView: document.getElementById('folder-view'),
+    folderSearchInput: document.getElementById('folder-search-input'),
+    useIdBtn: document.getElementById('use-id-btn'),
+    folderList: document.getElementById('folder-list'),
 
-document.addEventListener("DOMContentLoaded", () => {
-  const now = new Date();
-  els.dateSubtitle.textContent = now.toLocaleDateString(undefined, {
-    weekday: "long",
-    month: "long",
-    day: "numeric"
-  });
+    loadingView: document.getElementById('loading-view'),
+    loadingTitle: document.getElementById('loading-title'),
+    loadingStatus: document.getElementById('loading-status'),
 
-  const waitForGIS = setInterval(() => {
-    if (window.google && google.accounts && google.accounts.oauth2) {
-      clearInterval(waitForGIS);
-      initGoogleAuth();
+    memoriesView: document.getElementById('memories-view'),
+    slideshowProgress: document.getElementById('slideshow-progress'),
+    slideshowStage: document.getElementById('slideshow-stage'),
+    todayDateLabel: document.getElementById('today-date-label'),
+    activePhotoDate: document.getElementById('active-photo-date'),
+    prevSlideBtn: document.getElementById('prev-slide-btn'),
+    nextSlideBtn: document.getElementById('next-slide-btn'),
+
+    videoTrigger: document.getElementById('video-trigger'),
+    dailyVideoThumb: document.getElementById('daily-video-thumb'),
+    dailyVideoDate: document.getElementById('daily-video-date'),
+    noVideoState: document.getElementById('no-video-state'),
+    surpriseBtn: document.getElementById('surprise-btn'),
+
+    mediaModal: document.getElementById('media-modal'),
+    modalBadge: document.getElementById('modal-badge'),
+    modalDate: document.getElementById('modal-date'),
+    modalAnotherBtn: document.getElementById('modal-another-btn'),
+    closeModalBtn: document.getElementById('close-modal-btn'),
+    modalBody: document.getElementById('modal-body')
+  };
+
+  // View Switcher
+  function showView(viewName) {
+    dom.authView.hidden = viewName !== 'auth';
+    dom.folderView.hidden = viewName !== 'folder';
+    dom.loadingView.hidden = viewName !== 'loading';
+    dom.memoriesView.hidden = viewName !== 'memories';
+    dom.headerActions.hidden = viewName === 'auth';
+  }
+
+  // Date Utilities
+  function getTodayKey() {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function formatDisplayDate(file) {
+    const rawDate =
+      (file.imageMediaMetadata && file.imageMediaMetadata.time) ||
+      file.createdTime ||
+      file.modifiedTime;
+
+    if (!rawDate) {
+      return '';
     }
-  }, 100);
 
-  bindEvents();
-});
-
-function initGoogleAuth() {
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: CLIENT_ID,
-    scope: SCOPES,
-    callback: (tokenResponse) => {
-      if (tokenResponse.error) {
-        showError("Sign-in failed: " + tokenResponse.error);
-        return;
-      }
-      accessToken = tokenResponse.access_token;
-      els.signoutBtn.classList.remove("hidden");
-      onAuthenticated();
+    // Handle EXIF format "YYYY:MM:DD HH:MM:SS"
+    const normalized = rawDate.replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+    const parsed = new Date(normalized);
+    if (Number.isNaN(parsed.getTime())) {
+      return '';
     }
-  });
-}
 
-function bindEvents() {
-  els.signinBtn.addEventListener("click", () => {
-    if (!tokenClient) return;
-    tokenClient.requestAccessToken({ prompt: "consent" });
-  });
+    return parsed.toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
+  }
 
-  els.signoutBtn.addEventListener("click", () => {
-    if (accessToken) {
-      google.accounts.oauth2.revoke(accessToken, () => {});
+  // Deterministic Seeded PRNG (Mulberry32) so selections stay identical all day
+  function hashSeed(str) {
+    let h = 1779033703 ^ str.length;
+    for (let i = 0; i < str.length; i += 1) {
+      h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+      h = (h << 13) | (h >>> 19);
     }
-    stopSlideshow();
-    cleanupStage();
-    accessToken = null;
-    allPhotos = [];
-    allVideos = [];
-    els.signoutBtn.classList.add("hidden");
-    switchView("auth");
-  });
-
-  els.saveFolderBtn.addEventListener("click", handleSaveFolder);
-  els.changeFolderBtn.addEventListener("click", () => {
-    stopSlideshow();
-    els.folderInput.value = localStorage.getItem(STORAGE_KEYS.FOLDER_ID) || "";
-    switchView("setup");
-  });
-
-  els.retryBtn.addEventListener("click", () => loadDailyMemories());
-  els.videoPosterCard.addEventListener("click", () => openDailyVideoModal());
-  els.surpriseBtn.addEventListener("click", handleSurpriseMe);
-
-  els.modalClose.addEventListener("click", closeModal);
-  els.modal.querySelector(".modal-backdrop").addEventListener("click", closeModal);
-}
-
-function switchView(viewName) {
-  Object.values(views).forEach((v) => v.classList.remove("active"));
-  views[viewName].classList.add("active");
-}
-
-function extractFolderId(input) {
-  const trimmed = input.trim();
-  const urlMatch = trimmed.match(/folders\/([a-zA-Z0-9_-]+)/);
-  if (urlMatch && urlMatch[1]) return urlMatch[1];
-
-  const idMatch = trimmed.match(/^[a-zA-Z0-9_-]{15,}$/);
-  if (idMatch) return trimmed;
-
-  return null;
-}
-
-function handleSaveFolder() {
-  const folderId = extractFolderId(els.folderInput.value);
-  if (!folderId) {
-    els.setupError.textContent = "Please enter a valid Google Drive folder link or ID.";
-    els.setupError.classList.remove("hidden");
-    return;
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    return (h ^= h >>> 16) >>> 0;
   }
 
-  els.setupError.classList.add("hidden");
-  const previousFolderId = localStorage.getItem(STORAGE_KEYS.FOLDER_ID);
-  localStorage.setItem(STORAGE_KEYS.FOLDER_ID, folderId);
-
-  if (previousFolderId !== folderId) {
-    localStorage.removeItem(STORAGE_KEYS.DAILY_STATE);
+  function createSeededRandom(seedStr) {
+    let a = hashSeed(seedStr);
+    return function nextRandom() {
+      let t = (a += 0x6d2b79f5);
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
   }
 
-  loadDailyMemories();
-}
-
-function onAuthenticated() {
-  const savedFolderId = localStorage.getItem(STORAGE_KEYS.FOLDER_ID);
-  if (!savedFolderId) {
-    switchView("setup");
-  } else {
-    loadDailyMemories();
-  }
-}
-
-async function driveFetch(url, options = {}) {
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      ...(options.headers || {})
+  function pickSeededSubset(items, count, seedStr) {
+    if (!items.length) return [];
+    const rng = createSeededRandom(seedStr);
+    const copy = [...items];
+    for (let i = copy.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rng() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
     }
-  });
-
-  if (res.status === 401) {
-    throw new Error("SESSION_EXPIRED");
+    return copy.slice(0, Math.min(count, copy.length));
   }
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.error?.message || `Drive API Error (${res.status})`);
+
+  // Google OAuth Initialization
+  function initGoogleAuth() {
+    if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
+      setTimeout(initGoogleAuth, 150);
+      return;
+    }
+
+    state.tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPES,
+      callback: handleAuthResponse
+    });
   }
-  return res;
-}
 
-async function fetchMediaInFolder(rootFolderId) {
-  const photos = [];
-  const videos = [];
-  const foldersToScan = [rootFolderId];
-  const scannedFolders = new Set();
+  function handleAuthResponse(response) {
+    if (response.error || !response.access_token) {
+      dom.authError.textContent = 'Google sign-in failed. Please try again.';
+      dom.authError.hidden = false;
+      return;
+    }
 
-  while (foldersToScan.length > 0) {
-    const currentFolderId = foldersToScan.shift();
-    if (scannedFolders.has(currentFolderId)) continue;
-    scannedFolders.add(currentFolderId);
+    dom.authError.hidden = true;
+    state.accessToken = response.access_token;
 
-    let pageToken = null;
-    do {
-      const q = encodeURIComponent(
-        `'${currentFolderId}' in parents and trashed = false and (mimeType contains 'image/' or mimeType contains 'video/' or mimeType = 'application/vnd.google-apps.folder')`
-      );
-      const fields = encodeURIComponent(
-        "nextPageToken, files(id, name, mimeType, createdTime, thumbnailLink, imageMediaMetadata(time))"
-      );
-      let url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=${fields}&pageSize=1000&includeItemsFromAllDrives=true&supportsAllDrives=true`;
-      if (pageToken) url += `&pageToken=${pageToken}`;
-
-      const res = await driveFetch(url);
-      const data = await res.json();
-
-      for (const file of data.files || []) {
-        if (file.mimeType === "application/vnd.google-apps.folder") {
-          foldersToScan.push(file.id);
-        } else if (file.mimeType.startsWith("image/")) {
-          photos.push(file);
-        } else if (file.mimeType.startsWith("video/")) {
-          videos.push(file);
+    const savedFolderRaw = localStorage.getItem(STORAGE_KEYS.FOLDER);
+    if (savedFolderRaw) {
+      try {
+        const savedFolder = JSON.parse(savedFolderRaw);
+        if (savedFolder && savedFolder.id) {
+          selectFolderAndLoad(savedFolder);
+          return;
         }
+      } catch (err) {
+        localStorage.removeItem(STORAGE_KEYS.FOLDER);
       }
-      pageToken = data.nextPageToken;
-    } while (pageToken);
+    }
+
+    openFolderPicker();
   }
 
-  return { photos, videos };
-}
+  function triggerSignIn() {
+    if (!state.tokenClient) {
+      dom.authError.textContent = 'Google authentication is still loading. Try again in a moment.';
+      dom.authError.hidden = false;
+      return;
+    }
+    state.tokenClient.requestAccessToken({ prompt: '' });
+  }
 
-function trackBlobUrl(url) {
-  activeBlobUrls.push(url);
-  return url;
-}
+  function signOut() {
+    stopSlideshowTimer();
+    revokeAllObjectUrls();
+    if (state.accessToken && window.google && window.google.accounts) {
+      window.google.accounts.oauth2.revoke(state.accessToken, () => {});
+    }
+    state.accessToken = null;
+    state.selectedFolder = null;
+    localStorage.removeItem(STORAGE_KEYS.FOLDER);
+    showView('auth');
+  }
 
-async function fetchMediaBlobUrl(fileId) {
-  const mediaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
-  const res = await driveFetch(mediaUrl);
-  const blob = await res.blob();
-  return trackBlobUrl(URL.createObjectURL(blob));
-}
+  // Google Drive API Helpers
+  async function driveFetchJson(url) {
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${state.accessToken}`
+      }
+    });
 
-async function fetchThumbnailBlobUrl(file) {
-  if (!file.thumbnailLink) return null;
-  try {
-    const res = await driveFetch(file.thumbnailLink);
+    if (res.status === 401) {
+      state.accessToken = null;
+      showView('auth');
+      throw new Error('Session expired. Please sign in again.');
+    }
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Drive API error (${res.status}): ${errText}`);
+    }
+
+    return res.json();
+  }
+
+  async function fetchAuthenticatedBlobUrl(fileId) {
+    const url = `${DRIVE_API_BASE}/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${state.accessToken}`
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`Media download failed (${res.status})`);
+    }
+
     const blob = await res.blob();
-    return trackBlobUrl(URL.createObjectURL(blob));
-  } catch {
+    const objectUrl = URL.createObjectURL(blob);
+    state.objectUrls.add(objectUrl);
+    return objectUrl;
+  }
+
+  function revokeAllObjectUrls() {
+    state.objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    state.objectUrls.clear();
+  }
+
+  // Folder Picker Logic (Supports Shared With Me & My Drive)
+  async function openFolderPicker(searchTerm = '') {
+    stopSlideshowTimer();
+    showView('folder');
+    dom.folderList.innerHTML = '<div class="loader-inline">Loading shared & Drive folders...</div>';
+
+    try {
+      const escapedSearch = searchTerm.replace(/'/g, "\\'");
+      let query = "mimeType = 'application/vnd.google-apps.folder' and trashed = false";
+      if (escapedSearch) {
+        query += ` and name contains '${escapedSearch}'`;
+      } else {
+        query += ' and (sharedWithMe = true or "root" in parents)';
+      }
+
+      const params = new URLSearchParams({
+        q: query,
+        fields: 'files(id, name, shared, sharedWithMeTime, owners(displayName))',
+        orderBy: 'sharedWithMeTime desc, modifiedTime desc',
+        pageSize: '40',
+        includeItemsFromAllDrives: 'true',
+        supportsAllDrives: 'true'
+      });
+
+      const data = await driveFetchJson(`${DRIVE_API_BASE}?${params.toString()}`);
+      renderFolderList(data.files || []);
+    } catch (err) {
+      dom.folderList.innerHTML = `<div class="loader-inline">${err.message}</div>`;
+    }
+  }
+
+  function renderFolderList(folders) {
+    if (!folders.length) {
+      dom.folderList.innerHTML =
+        '<div class="loader-inline">No matching folders found. Try searching or pasting a folder ID/URL above.</div>';
+      return;
+    }
+
+    dom.folderList.innerHTML = '';
+    folders.forEach((folder) => {
+      const item = document.createElement('div');
+      item.className = 'folder-item';
+
+      const isShared = Boolean(folder.shared || folder.sharedWithMeTime);
+      item.innerHTML = `
+        <div class="folder-item-left">
+          <span>📁</span>
+          <span class="folder-name">${escapeHtml(folder.name)}</span>
+        </div>
+        ${isShared ? '<span class="shared-pill">Shared</span>' : ''}
+      `;
+
+      item.addEventListener('click', () => {
+        selectFolderAndLoad({ id: folder.id, name: folder.name });
+      });
+
+      dom.folderList.appendChild(item);
+    });
+  }
+
+  function extractFolderId(input) {
+    const trimmed = input.trim();
+    const urlMatch = trimmed.match(/folders\/([a-zA-Z0-9_-]+)/);
+    if (urlMatch) return urlMatch[1];
+    const idParamMatch = trimmed.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    if (idParamMatch) return idParamMatch[1];
+    if (/^[a-zA-Z0-9_-]{15,}$/.test(trimmed)) return trimmed;
     return null;
   }
-}
 
-function getTodayKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
+  async function handleFolderSearchOrOpen() {
+    const rawValue = dom.folderSearchInput.value.trim();
+    if (!rawValue) {
+      openFolderPicker();
+      return;
+    }
 
-function getDailyState() {
-  const today = getTodayKey();
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.DAILY_STATE);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (
-        parsed.date === today &&
-        Array.isArray(parsed.photoIds) &&
-        Array.isArray(parsed.shownIds)
-      ) {
-        return parsed;
+    const extractedId = extractFolderId(rawValue);
+    if (extractedId) {
+      try {
+        const params = new URLSearchParams({
+          fields: 'id, name, mimeType',
+          supportsAllDrives: 'true'
+        });
+        const folderMeta = await driveFetchJson(
+          `${DRIVE_API_BASE}/${encodeURIComponent(extractedId)}?${params.toString()}`
+        );
+        if (folderMeta.mimeType === 'application/vnd.google-apps.folder') {
+          selectFolderAndLoad({ id: folderMeta.id, name: folderMeta.name });
+          return;
+        }
+      } catch (err) {
+        // Fallback to name search
       }
     }
-  } catch {
-    // Ignore storage errors
-  }
-  return {
-    date: today,
-    photoIds: [],
-    videoId: null,
-    shownIds: []
-  };
-}
 
-function saveDailyState(state) {
-  localStorage.setItem(STORAGE_KEYS.DAILY_STATE, JSON.stringify(state));
-}
-
-function pickRandomItems(array, count) {
-  const copy = [...array];
-  for (let i = copy.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy.slice(0, count);
-}
-
-async function loadDailyMemories() {
-  switchView("memories");
-  stopSlideshow();
-  cleanupStage();
-  els.errorBanner.classList.add("hidden");
-  els.stage.classList.add("hidden");
-  els.loader.classList.remove("hidden");
-
-  const folderId = localStorage.getItem(STORAGE_KEYS.FOLDER_ID);
-
-  try {
-    const { photos, videos } = await fetchMediaInFolder(folderId);
-    allPhotos = photos;
-    allVideos = videos;
-
-    if (allPhotos.length === 0 && allVideos.length === 0) {
-      throw new Error("No photos or videos were found in this folder.");
-    }
-
-    els.poolStatus.textContent = `${allPhotos.length} photos · ${allVideos.length} videos`;
-
-    const state = getDailyState();
-    const photoMap = new Map(allPhotos.map((p) => [p.id, p]));
-    const videoMap = new Map(allVideos.map((v) => [v.id, v]));
-
-    let dailyPhotos = state.photoIds.map((id) => photoMap.get(id)).filter(Boolean);
-    if (dailyPhotos.length === 0 && allPhotos.length > 0) {
-      const unseenPhotos = allPhotos.filter((p) => !state.shownIds.includes(p.id));
-      const pool = unseenPhotos.length > 0 ? unseenPhotos : allPhotos;
-      dailyPhotos = pickRandomItems(pool, Math.min(5, pool.length));
-      state.photoIds = dailyPhotos.map((p) => p.id);
-    }
-
-    let dailyVideo = state.videoId ? videoMap.get(state.videoId) : null;
-    if (!dailyVideo && allVideos.length > 0) {
-      const unseenVideos = allVideos.filter((v) => !state.shownIds.includes(v.id));
-      const vPool = unseenVideos.length > 0 ? unseenVideos : allVideos;
-      [dailyVideo] = pickRandomItems(vPool, 1);
-      state.videoId = dailyVideo ? dailyVideo.id : null;
-    }
-
-    const idsToMark = [
-      ...dailyPhotos.map((p) => p.id),
-      ...(dailyVideo ? [dailyVideo.id] : [])
-    ];
-    state.shownIds = Array.from(new Set([...state.shownIds, ...idsToMark]));
-    saveDailyState(state);
-
-    slideEntries = [];
-    for (const photo of dailyPhotos) {
-      const entry = await buildSlideEntry(photo);
-      slideEntries.push(entry);
-    }
-
-    renderSlideshowDom();
-    await renderDailyVideoSection(dailyVideo);
-    updateSurpriseHint();
-
-    els.loader.classList.add("hidden");
-    els.stage.classList.remove("hidden");
-
-    if (slideEntries.length > 0) {
-      currentSlideIndex = 0;
-      activateSlide(0);
-      startSlideshow();
-    } else {
-      els.slideshowBox.classList.add("hidden");
-    }
-  } catch (err) {
-    els.loader.classList.add("hidden");
-    if (err.message === "SESSION_EXPIRED") {
-      tokenClient.requestAccessToken({ prompt: "" });
-    } else {
-      showError(err.message);
-    }
-  }
-}
-
-function isHeicFile(file) {
-  const mime = (file.mimeType || "").toLowerCase();
-  const name = (file.name || "").toLowerCase();
-  return mime.includes("heic") || mime.includes("heif") || name.endsWith(".heic") || name.endsWith(".heif");
-}
-
-async function buildSlideEntry(file) {
-  try {
-    const blobUrl = await fetchMediaBlobUrl(file.id);
-    const canDecode = await testImageCanDecode(blobUrl);
-
-    if (!canDecode && isHeicFile(file)) {
-      return { file, blobUrl: null, isHeicUnsupported: true };
-    }
-    return { file, blobUrl, isHeicUnsupported: false };
-  } catch {
-    if (isHeicFile(file)) {
-      return { file, blobUrl: null, isHeicUnsupported: true };
-    }
-    return { file, blobUrl: null, isHeicUnsupported: false };
-  }
-}
-
-function testImageCanDecode(url) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => resolve(img.naturalWidth > 0);
-    img.onerror = () => resolve(false);
-    img.src = url;
-  });
-}
-
-function renderSlideshowDom() {
-  els.slidesLayer.innerHTML = "";
-
-  slideEntries.forEach((entry, idx) => {
-    const slideEl = document.createElement("div");
-    slideEl.className = "slide";
-    slideEl.dataset.index = String(idx);
-
-    if (entry.blobUrl && !entry.isHeicUnsupported) {
-      const img = document.createElement("img");
-      img.src = entry.blobUrl;
-      img.alt = entry.file.name;
-      slideEl.appendChild(img);
-    }
-
-    els.slidesLayer.appendChild(slideEl);
-  });
-}
-
-function activateSlide(index) {
-  if (slideEntries.length === 0) return;
-  currentSlideIndex = index % slideEntries.length;
-  const entry = slideEntries[currentSlideIndex];
-
-  const allSlideEls = els.slidesLayer.querySelectorAll(".slide");
-  allSlideEls.forEach((el, i) => {
-    const isCurrent = i === currentSlideIndex;
-    el.classList.toggle("active", isCurrent);
-    el.classList.remove("ken-burns");
-    if (isCurrent && !entry.isHeicUnsupported) {
-      void el.offsetWidth;
-      el.classList.add("ken-burns");
-    }
-  });
-
-  if (entry.isHeicUnsupported) {
-    els.heicFilename.textContent = entry.file.name;
-    els.heicBanner.classList.remove("hidden");
-  } else {
-    els.heicBanner.classList.add("hidden");
+    openFolderPicker(rawValue);
   }
 
-  els.slideCounter.textContent = `${currentSlideIndex + 1} / ${slideEntries.length}`;
-  els.slideDate.textContent = formatPhotoDate(
-    entry.file.imageMediaMetadata?.time || entry.file.createdTime
-  );
-}
+  // Recursive Folder Scanner
+  function classifyMediaFile(file) {
+    const name = (file.name || '').toLowerCase();
+    const mime = (file.mimeType || '').toLowerCase();
+    const ext = name.includes('.') ? name.split('.').pop() : '';
 
-function startSlideshow() {
-  stopSlideshow();
-  if (slideEntries.length <= 1) return;
-  slideshowTimer = setInterval(() => {
-    activateSlide((currentSlideIndex + 1) % slideEntries.length);
-  }, SLIDE_INTERVAL_MS);
-}
-
-function stopSlideshow() {
-  if (slideshowTimer) {
-    clearInterval(slideshowTimer);
-    slideshowTimer = null;
-  }
-}
-
-async function renderDailyVideoSection(videoFile) {
-  dailyVideoFile = videoFile;
-  dailyVideoThumbUrl = null;
-
-  if (!videoFile) {
-    els.videoSection.classList.add("hidden");
-    return;
-  }
-
-  els.videoSection.classList.remove("hidden");
-  els.videoTitle.textContent = videoFile.name;
-  els.videoDate.textContent = formatPhotoDate(videoFile.createdTime);
-
-  const thumbUrl = await fetchThumbnailBlobUrl(videoFile);
-  if (thumbUrl) {
-    dailyVideoThumbUrl = thumbUrl;
-    els.videoThumbImg.src = thumbUrl;
-    els.videoThumbImg.classList.remove("hidden");
-    els.videoThumbFallback.classList.add("hidden");
-  } else {
-    els.videoThumbImg.classList.add("hidden");
-    els.videoThumbFallback.classList.remove("hidden");
-  }
-}
-
-async function openDailyVideoModal() {
-  if (!dailyVideoFile) return;
-
-  els.modalBadge.textContent = "Daily Video";
-  els.modalCaption.textContent = `${formatPhotoDate(dailyVideoFile.createdTime)} — ${dailyVideoFile.name}`;
-  els.modalBody.innerHTML = `<div class="spinner"></div>`;
-  els.modal.classList.remove("hidden");
-
-  try {
-    const videoUrl = await fetchMediaBlobUrl(dailyVideoFile.id);
-    els.modalBody.innerHTML = "";
-    const videoEl = document.createElement("video");
-    videoEl.src = videoUrl;
-    videoEl.controls = true;
-    videoEl.playsInline = true;
-    videoEl.preload = "metadata";
-    if (dailyVideoThumbUrl) {
-      videoEl.poster = dailyVideoThumbUrl;
+    if (ext === 'heic' || mime === 'image/heic' || mime === 'image/heif') {
+      return { type: 'photo', isHeic: true };
     }
-    videoEl.autoplay = false;
-    els.modalBody.appendChild(videoEl);
-  } catch (err) {
-    els.modalBody.innerHTML = `<p class="error-text" style="padding:16px;">Could not load video: ${escapeHtml(err.message)}</p>`;
-  }
-}
 
-async function handleSurpriseMe() {
-  const combined = [...allPhotos, ...allVideos];
-  if (combined.length === 0) return;
+    if (PHOTO_EXTENSIONS.has(ext) || mime.startsWith('image/')) {
+      return { type: 'photo', isHeic: false };
+    }
 
-  const state = getDailyState();
-  let candidates = combined.filter((item) => !state.shownIds.includes(item.id));
-  if (candidates.length === 0) {
-    candidates = combined;
+    if (VIDEO_EXTENSIONS.has(ext) || mime.startsWith('video/')) {
+      return { type: 'video', isHeic: false };
+    }
+
+    return null;
   }
 
-  const [picked] = pickRandomItems(candidates, 1);
+  async function listChildrenOfFolder(folderId) {
+    const allItems = [];
+    let pageToken = null;
 
-  if (!state.shownIds.includes(picked.id)) {
-    state.shownIds.push(picked.id);
-    saveDailyState(state);
-    updateSurpriseHint();
+    do {
+      const params = new URLSearchParams({
+        q: `'${folderId}' in parents and trashed = false`,
+        fields:
+          'nextPageToken, files(id, name, mimeType, createdTime, modifiedTime, thumbnailLink, imageMediaMetadata(time))',
+        pageSize: '200',
+        includeItemsFromAllDrives: 'true',
+        supportsAllDrives: 'true'
+      });
+
+      if (pageToken) {
+        params.set('pageToken', pageToken);
+      }
+
+      const data = await driveFetchJson(`${DRIVE_API_BASE}?${params.toString()}`);
+      if (data.files && data.files.length) {
+        allItems.push(...data.files);
+      }
+      pageToken = data.nextPageToken || null;
+    } while (pageToken);
+
+    return allItems;
   }
 
-  const isVideo = (picked.mimeType || "").startsWith("video/");
-  els.modalBadge.textContent = isVideo ? "🎲 Surprise Video" : "🎲 Surprise Photo";
-  els.modalCaption.textContent = `${formatPhotoDate(picked.imageMediaMetadata?.time || picked.createdTime)} — ${picked.name}`;
-  els.modalBody.innerHTML = `<div class="spinner"></div>`;
-  els.modal.classList.remove("hidden");
+  async function scanFolderRecursively(rootFolderId) {
+    const photos = [];
+    const videos = [];
+    const visited = new Set([rootFolderId]);
+    const queue = [rootFolderId];
+    let scannedFolders = 0;
 
-  try {
-    const mediaUrl = await fetchMediaBlobUrl(picked.id);
-    els.modalBody.innerHTML = "";
+    while (queue.length > 0) {
+      const currentId = queue.shift();
+      scannedFolders += 1;
+      dom.loadingStatus.textContent = `Scanned ${scannedFolders} folder${scannedFolders === 1 ? '' : 's'} • Found ${photos.length} photos & ${videos.length} videos`;
 
-    if (isVideo) {
-      const videoEl = document.createElement("video");
-      videoEl.src = mediaUrl;
-      videoEl.controls = true;
-      videoEl.playsInline = true;
-      videoEl.preload = "metadata";
-      videoEl.autoplay = false;
-      els.modalBody.appendChild(videoEl);
-    } else {
-      const canDecode = await testImageCanDecode(mediaUrl);
-      if (!canDecode && isHeicFile(picked)) {
-        els.modalBody.innerHTML = `
-          <div class="modal-heic-card">
-            <span class="heic-icon">📱</span>
-            <div class="heic-copy">
-              <strong>HEIC image - view on iPhone</strong>
-              <span>${escapeHtml(picked.name)}</span>
-            </div>
-          </div>
-        `;
+      const children = await listChildrenOfFolder(currentId);
+      for (const item of children) {
+        if (item.mimeType === 'application/vnd.google-apps.folder') {
+          if (!visited.has(item.id)) {
+            visited.add(item.id);
+            queue.push(item.id);
+          }
+        } else {
+          const mediaInfo = classifyMediaFile(item);
+          if (mediaInfo) {
+            const enriched = {
+              ...item,
+              mediaType: mediaInfo.type,
+              isHeic: mediaInfo.isHeic,
+              displayDate: formatDisplayDate(item)
+            };
+            if (mediaInfo.type === 'photo') {
+              photos.push(enriched);
+            } else {
+              videos.push(enriched);
+            }
+          }
+        }
+      }
+    }
+
+    // Sort deterministically by ID before daily seeded selection
+    photos.sort((a, b) => a.id.localeCompare(b.id));
+    videos.sort((a, b) => a.id.localeCompare(b.id));
+
+    return { photos, videos };
+  }
+
+  async function selectFolderAndLoad(folder) {
+    state.selectedFolder = folder;
+    localStorage.setItem(STORAGE_KEYS.FOLDER, JSON.stringify(folder));
+    dom.currentFolderLabel.textContent = folder.name;
+
+    showView('loading');
+    dom.loadingTitle.textContent = `Scanning "${folder.name}"`;
+    dom.loadingStatus.textContent = 'Searching subfolders for memories...';
+
+    try {
+      const { photos, videos } = await scanFolderRecursively(folder.id);
+      state.allPhotos = photos;
+      state.allVideos = videos;
+
+      if (!photos.length && !videos.length) {
+        dom.loadingStatus.textContent =
+          'No supported photos or videos were found in this folder. Pick another folder.';
+        setTimeout(() => openFolderPicker(), 1800);
+        return;
+      }
+
+      prepareDailyMemories();
+      renderDashboard();
+      showView('memories');
+    } catch (err) {
+      dom.loadingStatus.textContent = `Error scanning folder: ${err.message}`;
+      setTimeout(() => openFolderPicker(), 2200);
+    }
+  }
+
+  // Daily Selection (5 Photos + 1 Video preserved all day, rotates next day)
+  function prepareDailyMemories() {
+    const todayKey = getTodayKey();
+    const folderId = state.selectedFolder.id;
+
+    state.dailyPhotos = pickSeededSubset(
+      state.allPhotos,
+      5,
+      `photos:${folderId}:${todayKey}`
+    );
+
+    const videoSelection = pickSeededSubset(
+      state.allVideos,
+      1,
+      `video:${folderId}:${todayKey}`
+    );
+    state.dailyVideo = videoSelection.length ? videoSelection[0] : null;
+  }
+
+  // HEIC Fallback Helper
+  function renderHeicPlaceholder(container) {
+    container.innerHTML = `
+      <div class="heic-placeholder">
+        <div class="heic-icon">🖼️</div>
+        <p>HEIC image - best viewed on iPhone</p>
+      </div>
+    `;
+  }
+
+  async function loadImageIntoElement(file, container) {
+    try {
+      const blobUrl = await fetchAuthenticatedBlobUrl(file.id);
+      const img = document.createElement('img');
+      img.alt = file.name || 'Memory photo';
+
+      img.onload = () => {
+        container.innerHTML = '';
+        container.appendChild(img);
+      };
+
+      img.onerror = () => {
+        if (file.isHeic) {
+          renderHeicPlaceholder(container);
+        } else {
+          container.innerHTML = '<div class="loader-inline">Unable to display image</div>';
+        }
+      };
+
+      img.src = blobUrl;
+    } catch (err) {
+      if (file.isHeic) {
+        renderHeicPlaceholder(container);
       } else {
-        const imgEl = document.createElement("img");
-        imgEl.src = mediaUrl;
-        imgEl.alt = picked.name;
-        els.modalBody.appendChild(imgEl);
+        container.innerHTML = '<div class="loader-inline">Could not load photo</div>';
       }
     }
-  } catch (err) {
-    els.modalBody.innerHTML = `<p class="error-text" style="padding:16px;">Could not load memory: ${escapeHtml(err.message)}</p>`;
   }
-}
 
-function closeModal() {
-  const videoEl = els.modalBody.querySelector("video");
-  if (videoEl) {
-    videoEl.pause();
-    videoEl.removeAttribute("src");
-    videoEl.load();
+  // Render Dashboard (Slideshow + Daily Video)
+  function renderDashboard() {
+    revokeAllObjectUrls();
+    stopSlideshowTimer();
+
+    const todayFormatted = new Date().toLocaleDateString(undefined, {
+      weekday: 'long',
+      month: 'short',
+      day: 'numeric'
+    });
+    dom.todayDateLabel.textContent = todayFormatted;
+
+    renderSlideshow();
+    renderDailyVideo();
   }
-  els.modalBody.innerHTML = "";
-  els.modal.classList.add("hidden");
-}
 
-function updateSurpriseHint() {
-  const state = getDailyState();
-  const total = allPhotos.length + allVideos.length;
-  const unseen = Math.max(0, total - state.shownIds.length);
-  els.poolRemaining.textContent = `${unseen} unseen ${unseen === 1 ? "item" : "items"} remaining today`;
-}
+  function renderSlideshow() {
+    dom.slideshowProgress.innerHTML = '';
+    dom.slideshowStage.innerHTML = '';
 
-function cleanupStage() {
-  els.slidesLayer.innerHTML = "";
-  els.heicBanner.classList.add("hidden");
-  els.slideshowBox.classList.remove("hidden");
-  activeBlobUrls.forEach((url) => URL.revokeObjectURL(url));
-  activeBlobUrls = [];
-  slideEntries = [];
-  dailyVideoFile = null;
-  dailyVideoThumbUrl = null;
-}
+    if (!state.dailyPhotos.length) {
+      dom.slideshowStage.innerHTML =
+        '<div class="loader-inline">No photos found in this folder</div>';
+      dom.activePhotoDate.textContent = '';
+      return;
+    }
 
-function showError(msg) {
-  els.errorMessage.textContent = msg;
-  els.errorBanner.classList.remove("hidden");
-}
+    state.dailyPhotos.forEach((photo, idx) => {
+      // Progress Segment
+      const seg = document.createElement('div');
+      seg.className = 'progress-segment';
+      seg.innerHTML = '<div class="progress-fill"></div>';
+      seg.addEventListener('click', () => goToSlide(idx));
+      dom.slideshowProgress.appendChild(seg);
 
-function formatPhotoDate(dateStr) {
-  if (!dateStr) return "Shared Memory";
-  const normalized = dateStr.replace(/^(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3");
-  const date = new Date(normalized);
-  if (isNaN(date.getTime())) return "Shared Memory";
+      // Slide Container
+      const slide = document.createElement('div');
+      slide.className = 'slide-item';
+      slide.innerHTML = '<div class="loader-inline">Loading memory...</div>';
+      dom.slideshowStage.appendChild(slide);
 
-  return date.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric"
-  });
-}
+      loadImageIntoElement(photo, slide);
+    });
 
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (m) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
-  }[m]));
-}
+    state.currentSlideIndex = 0;
+    activateSlide(0);
+    startSlideshowTimer();
+  }
+
+  function activateSlide(index) {
+    const slides = dom.slideshowStage.querySelectorAll('.slide-item');
+    const segments = dom.slideshowProgress.querySelectorAll('.progress-segment');
+    if (!slides.length) return;
+
+    slides.forEach((slide, i) => {
+      slide.classList.toggle('active', i === index);
+    });
+
+    segments.forEach((seg, i) => {
+      seg.classList.remove('active', 'completed');
+      if (i < index) {
+        seg.classList.add('completed');
+      } else if (i === index) {
+        // Trigger reflow so animation restarts cleanly
+        void seg.offsetWidth;
+        seg.classList.add('active');
+      }
+    });
+
+    const activePhoto = state.dailyPhotos[index];
+    dom.activePhotoDate.textContent = activePhoto && activePhoto.displayDate
+      ? activePhoto.displayDate
+      : '';
+  }
+
+  function goToSlide(index) {
+    const count = state.dailyPhotos.length;
+    if (!count) return;
+    state.currentSlideIndex = (index + count) % count;
+    activateSlide(state.currentSlideIndex);
+    startSlideshowTimer();
+  }
+
+  function startSlideshowTimer() {
+    stopSlideshowTimer();
+    if (state.dailyPhotos.length <= 1) return;
+    state.slideTimer = setInterval(() => {
+      goToSlide(state.currentSlideIndex + 1);
+    }, 5000);
+  }
+
+  function stopSlideshowTimer() {
+    if (state.slideTimer) {
+      clearInterval(state.slideTimer);
+      state.slideTimer = null;
+    }
+  }
+
+  async function renderDailyVideo() {
+    if (!state.dailyVideo) {
+      dom.videoTrigger.hidden = true;
+      dom.noVideoState.hidden = false;
+      return;
+    }
+
+    dom.videoTrigger.hidden = false;
+    dom.noVideoState.hidden = true;
+    dom.dailyVideoDate.textContent = state.dailyVideo.displayDate || 'Tap to play';
+
+    // Load large thumbnail
+    if (state.dailyVideo.thumbnailLink) {
+      const highResThumb = state.dailyVideo.thumbnailLink.replace(/=s\d+$/, '=s960');
+      dom.dailyVideoThumb.src = highResThumb;
+    } else {
+      // Fallback: grab first frame via blob URL
+      try {
+        const videoBlobUrl = await fetchAuthenticatedBlobUrl(state.dailyVideo.id);
+        const tempVideo = document.createElement('video');
+        tempVideo.src = videoBlobUrl;
+        tempVideo.muted = true;
+        tempVideo.currentTime = 0.5;
+        tempVideo.addEventListener('loadeddata', () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = tempVideo.videoWidth || 640;
+          canvas.height = tempVideo.videoHeight || 360;
+          canvas.getContext('2d').drawImage(tempVideo, 0, 0, canvas.width, canvas.height);
+          dom.dailyVideoThumb.src = canvas.toDataURL('image/jpeg');
+        });
+      } catch (err) {
+        dom.dailyVideoThumb.removeAttribute('src');
+      }
+    }
+  }
+
+  // Surprise Me Selection (Avoids recently shown items)
+  function getRecentSurpriseIds() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEYS.RECENT_SURPRISE);
+      return raw ? JSON.parse(raw) : [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  function recordSurpriseId(id) {
+    const recent = getRecentSurpriseIds().filter((existingId) => existingId !== id);
+    recent.push(id);
+    const maxHistory = Math.max(10, Math.floor((state.allPhotos.length + state.allVideos.length) * 0.6));
+    const trimmed = recent.slice(-maxHistory);
+    localStorage.setItem(STORAGE_KEYS.RECENT_SURPRISE, JSON.stringify(trimmed));
+  }
+
+  function pickSurpriseItem() {
+    const combined = [...state.allPhotos, ...state.allVideos];
+    if (!combined.length) return null;
+
+    const dailyIds = new Set(state.dailyPhotos.map((p) => p.id));
+    if (state.dailyVideo) dailyIds.add(state.dailyVideo.id);
+
+    const recentIds = new Set(getRecentSurpriseIds());
+
+    let candidates = combined.filter(
+      (item) => !recentIds.has(item.id) && !dailyIds.has(item.id)
+    );
+
+    if (!candidates.length) {
+      candidates = combined.filter((item) => !recentIds.has(item.id));
+    }
+
+    if (!candidates.length) {
+      localStorage.removeItem(STORAGE_KEYS.RECENT_SURPRISE);
+      candidates = combined;
+    }
+
+    const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+    recordSurpriseId(chosen.id);
+    return chosen;
+  }
+
+  // Modal Overlay (Video Playback & Surprise Memories)
+  async function openMediaModal(file, options = {}) {
+    const { isSurprise = false } = options;
+    stopSlideshowTimer();
+
+    dom.modalBadge.textContent = isSurprise ? '🎲 Surprise Memory' : 'Featured Video';
+    dom.modalDate.textContent = file.displayDate || '';
+    dom.modalAnotherBtn.hidden = !isSurprise;
+    dom.modalBody.innerHTML = '<div class="loader-inline">Loading memory...</div>';
+    dom.mediaModal.hidden = false;
+
+    if (file.mediaType === 'video') {
+      try {
+        const videoUrl = await fetchAuthenticatedBlobUrl(file.id);
+        dom.modalBody.innerHTML = '';
+        const videoEl = document.createElement('video');
+        videoEl.src = videoUrl;
+        videoEl.controls = true;
+        videoEl.playsInline = true;
+        videoEl.autoplay = true;
+        dom.modalBody.appendChild(videoEl);
+      } catch (err) {
+        dom.modalBody.innerHTML = `<div class="loader-inline">Could not load video: ${err.message}</div>`;
+      }
+    } else {
+      await loadImageIntoElement(file, dom.modalBody);
+    }
+  }
+
+  function closeMediaModal() {
+    const activeVideo = dom.modalBody.querySelector('video');
+    if (activeVideo) {
+      activeVideo.pause();
+      activeVideo.src = '';
+    }
+    dom.modalBody.innerHTML = '';
+    dom.mediaModal.hidden = true;
+    startSlideshowTimer();
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // Event Listeners
+  function bindEvents() {
+    dom.signInBtn.addEventListener('click', triggerSignIn);
+    dom.signOutBtn.addEventListener('click', signOut);
+    dom.changeFolderBtn.addEventListener('click', () => openFolderPicker());
+
+    dom.useIdBtn.addEventListener('click', handleFolderSearchOrOpen);
+    dom.folderSearchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        handleFolderSearchOrOpen();
+      }
+    });
+
+    dom.prevSlideBtn.addEventListener('click', () => goToSlide(state.currentSlideIndex - 1));
+    dom.nextSlideBtn.addEventListener('click', () => goToSlide(state.currentSlideIndex + 1));
+
+    // Touch swipe support on slideshow
+    let touchStartX = 0;
+    dom.slideshowStage.addEventListener(
+      'touchstart',
+      (e) => {
+        touchStartX = e.changedTouches[0].clientX;
+      },
+      { passive: true }
+    );
+
+    dom.slideshowStage.addEventListener(
+      'touchend',
+      (e) => {
+        const deltaX = e.changedTouches[0].clientX - touchStartX;
+        if (Math.abs(deltaX) > 40) {
+          goToSlide(state.currentSlideIndex + (deltaX < 0 ? 1 : -1));
+        }
+      },
+      { passive: true }
+    );
+
+    dom.videoTrigger.addEventListener('click', () => {
+      if (state.dailyVideo) {
+        openMediaModal(state.dailyVideo, { isSurprise: false });
+      }
+    });
+
+    dom.videoTrigger.addEventListener('keydown', (e) => {
+      if ((e.key === 'Enter' || e.key === ' ') && state.dailyVideo) {
+        e.preventDefault();
+        openMediaModal(state.dailyVideo, { isSurprise: false });
+      }
+    });
+
+    dom.surpriseBtn.addEventListener('click', () => {
+      const surpriseItem = pickSurpriseItem();
+      if (surpriseItem) {
+        openMediaModal(surpriseItem, { isSurprise: true });
+      }
+    });
+
+    dom.modalAnotherBtn.addEventListener('click', () => {
+      const surpriseItem = pickSurpriseItem();
+      if (surpriseItem) {
+        openMediaModal(surpriseItem, { isSurprise: true });
+      }
+    });
+
+    dom.closeModalBtn.addEventListener('click', closeMediaModal);
+    dom.mediaModal.addEventListener('click', (e) => {
+      if (e.target === dom.mediaModal) {
+        closeMediaModal();
+      }
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !dom.mediaModal.hidden) {
+        closeMediaModal();
+      }
+    });
+  }
+
+  // Initialize App
+  bindEvents();
+  initGoogleAuth();
+})();
