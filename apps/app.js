@@ -2,6 +2,7 @@
   'use strict';
 
   const CLIENT_ID = '402006802634-ic218vn97iho61k7b511g2eicl4noa6q.apps.googleusercontent.com';
+  const FAMILY_FOLDER_ID = '1AmO-d1qxzeaPYpo7GmpdKzCHQi4MX1mN';
   const SCOPES = 'https://www.googleapis.com/auth/drive.readonly';
   const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3/files';
 
@@ -19,14 +20,12 @@
   ]);
 
   const STORAGE_KEYS = {
-    FOLDER: 'dm_selected_folder_v1',
     RECENT_SURPRISE: 'dm_recent_surprise_ids_v1'
   };
 
   const state = {
     accessToken: null,
     tokenClient: null,
-    selectedFolder: null,
     allPhotos: [],
     allVideos: [],
     dailyPhotos: [],
@@ -39,18 +38,11 @@
   // DOM References
   const dom = {
     headerActions: document.getElementById('header-actions'),
-    currentFolderLabel: document.getElementById('current-folder-label'),
-    changeFolderBtn: document.getElementById('change-folder-btn'),
     signOutBtn: document.getElementById('sign-out-btn'),
 
     authView: document.getElementById('auth-view'),
     signInBtn: document.getElementById('sign-in-btn'),
     authError: document.getElementById('auth-error'),
-
-    folderView: document.getElementById('folder-view'),
-    folderSearchInput: document.getElementById('folder-search-input'),
-    useIdBtn: document.getElementById('use-id-btn'),
-    folderList: document.getElementById('folder-list'),
 
     loadingView: document.getElementById('loading-view'),
     loadingTitle: document.getElementById('loading-title'),
@@ -81,7 +73,6 @@
   // View Switcher
   function showView(viewName) {
     dom.authView.hidden = viewName !== 'auth';
-    dom.folderView.hidden = viewName !== 'folder';
     dom.loadingView.hidden = viewName !== 'loading';
     dom.memoriesView.hidden = viewName !== 'memories';
     dom.headerActions.hidden = viewName === 'auth';
@@ -176,21 +167,7 @@
 
     dom.authError.hidden = true;
     state.accessToken = response.access_token;
-
-    const savedFolderRaw = localStorage.getItem(STORAGE_KEYS.FOLDER);
-    if (savedFolderRaw) {
-      try {
-        const savedFolder = JSON.parse(savedFolderRaw);
-        if (savedFolder && savedFolder.id) {
-          selectFolderAndLoad(savedFolder);
-          return;
-        }
-      } catch (err) {
-        localStorage.removeItem(STORAGE_KEYS.FOLDER);
-      }
-    }
-
-    openFolderPicker();
+    loadFamilyArchive();
   }
 
   function triggerSignIn() {
@@ -209,8 +186,10 @@
       window.google.accounts.oauth2.revoke(state.accessToken, () => {});
     }
     state.accessToken = null;
-    state.selectedFolder = null;
-    localStorage.removeItem(STORAGE_KEYS.FOLDER);
+    state.allPhotos = [];
+    state.allVideos = [];
+    state.dailyPhotos = [];
+    state.dailyVideo = null;
     showView('auth');
   }
 
@@ -259,106 +238,7 @@
     state.objectUrls.clear();
   }
 
-  // Folder Picker Logic (Supports Shared With Me & My Drive)
-  async function openFolderPicker(searchTerm = '') {
-    stopSlideshowTimer();
-    showView('folder');
-    dom.folderList.innerHTML = '<div class="loader-inline">Loading shared & Drive folders...</div>';
-
-    try {
-      const escapedSearch = searchTerm.replace(/'/g, "\\'");
-      let query = "mimeType = 'application/vnd.google-apps.folder' and trashed = false";
-      if (escapedSearch) {
-        query += ` and name contains '${escapedSearch}'`;
-      } else {
-        query += ' and (sharedWithMe = true or "root" in parents)';
-      }
-
-      const params = new URLSearchParams({
-        q: query,
-        fields: 'files(id, name, shared, sharedWithMeTime, owners(displayName))',
-        orderBy: 'sharedWithMeTime desc, modifiedTime desc',
-        pageSize: '40',
-        includeItemsFromAllDrives: 'true',
-        supportsAllDrives: 'true'
-      });
-
-      const data = await driveFetchJson(`${DRIVE_API_BASE}?${params.toString()}`);
-      renderFolderList(data.files || []);
-    } catch (err) {
-      dom.folderList.innerHTML = `<div class="loader-inline">${err.message}</div>`;
-    }
-  }
-
-  function renderFolderList(folders) {
-    if (!folders.length) {
-      dom.folderList.innerHTML =
-        '<div class="loader-inline">No matching folders found. Try searching or pasting a folder ID/URL above.</div>';
-      return;
-    }
-
-    dom.folderList.innerHTML = '';
-    folders.forEach((folder) => {
-      const item = document.createElement('div');
-      item.className = 'folder-item';
-
-      const isShared = Boolean(folder.shared || folder.sharedWithMeTime);
-      item.innerHTML = `
-        <div class="folder-item-left">
-          <span>📁</span>
-          <span class="folder-name">${escapeHtml(folder.name)}</span>
-        </div>
-        ${isShared ? '<span class="shared-pill">Shared</span>' : ''}
-      `;
-
-      item.addEventListener('click', () => {
-        selectFolderAndLoad({ id: folder.id, name: folder.name });
-      });
-
-      dom.folderList.appendChild(item);
-    });
-  }
-
-  function extractFolderId(input) {
-    const trimmed = input.trim();
-    const urlMatch = trimmed.match(/folders\/([a-zA-Z0-9_-]+)/);
-    if (urlMatch) return urlMatch[1];
-    const idParamMatch = trimmed.match(/[?&]id=([a-zA-Z0-9_-]+)/);
-    if (idParamMatch) return idParamMatch[1];
-    if (/^[a-zA-Z0-9_-]{15,}$/.test(trimmed)) return trimmed;
-    return null;
-  }
-
-  async function handleFolderSearchOrOpen() {
-    const rawValue = dom.folderSearchInput.value.trim();
-    if (!rawValue) {
-      openFolderPicker();
-      return;
-    }
-
-    const extractedId = extractFolderId(rawValue);
-    if (extractedId) {
-      try {
-        const params = new URLSearchParams({
-          fields: 'id, name, mimeType',
-          supportsAllDrives: 'true'
-        });
-        const folderMeta = await driveFetchJson(
-          `${DRIVE_API_BASE}/${encodeURIComponent(extractedId)}?${params.toString()}`
-        );
-        if (folderMeta.mimeType === 'application/vnd.google-apps.folder') {
-          selectFolderAndLoad({ id: folderMeta.id, name: folderMeta.name });
-          return;
-        }
-      } catch (err) {
-        // Fallback to name search
-      }
-    }
-
-    openFolderPicker(rawValue);
-  }
-
-  // Recursive Folder Scanner
+  // Recursive Folder Scanner for Hardcoded Family Archive
   function classifyMediaFile(file) {
     const name = (file.name || '').toLowerCase();
     const mime = (file.mimeType || '').toLowerCase();
@@ -452,51 +332,38 @@
     return { photos, videos };
   }
 
-  async function selectFolderAndLoad(folder) {
-    state.selectedFolder = folder;
-    localStorage.setItem(STORAGE_KEYS.FOLDER, JSON.stringify(folder));
-    dom.currentFolderLabel.textContent = folder.name;
-
+  async function loadFamilyArchive() {
     showView('loading');
-    dom.loadingTitle.textContent = `Scanning "${folder.name}"`;
-    dom.loadingStatus.textContent = 'Searching subfolders for memories...';
+    dom.loadingTitle.textContent = "Curating Today's Memories";
+    dom.loadingStatus.textContent = 'Scanning family archive...';
 
     try {
-      const { photos, videos } = await scanFolderRecursively(folder.id);
+      const { photos, videos } = await scanFolderRecursively(FAMILY_FOLDER_ID);
       state.allPhotos = photos;
       state.allVideos = videos;
-
-      if (!photos.length && !videos.length) {
-        dom.loadingStatus.textContent =
-          'No supported photos or videos were found in this folder. Pick another folder.';
-        setTimeout(() => openFolderPicker(), 1800);
-        return;
-      }
 
       prepareDailyMemories();
       renderDashboard();
       showView('memories');
     } catch (err) {
-      dom.loadingStatus.textContent = `Error scanning folder: ${err.message}`;
-      setTimeout(() => openFolderPicker(), 2200);
+      dom.loadingStatus.textContent = `Unable to load family archive: ${err.message}`;
     }
   }
 
   // Daily Selection (5 Photos + 1 Video preserved all day, rotates next day)
   function prepareDailyMemories() {
     const todayKey = getTodayKey();
-    const folderId = state.selectedFolder.id;
 
     state.dailyPhotos = pickSeededSubset(
       state.allPhotos,
       5,
-      `photos:${folderId}:${todayKey}`
+      `photos:${FAMILY_FOLDER_ID}:${todayKey}`
     );
 
     const videoSelection = pickSeededSubset(
       state.allVideos,
       1,
-      `video:${folderId}:${todayKey}`
+      `video:${FAMILY_FOLDER_ID}:${todayKey}`
     );
     state.dailyVideo = videoSelection.length ? videoSelection[0] : null;
   }
@@ -562,7 +429,7 @@
 
     if (!state.dailyPhotos.length) {
       dom.slideshowStage.innerHTML =
-        '<div class="loader-inline">No photos found in this folder</div>';
+        '<div class="loader-inline">No photos found in archive</div>';
       dom.activePhotoDate.textContent = '';
       return;
     }
@@ -610,9 +477,8 @@
     });
 
     const activePhoto = state.dailyPhotos[index];
-    dom.activePhotoDate.textContent = activePhoto && activePhoto.displayDate
-      ? activePhoto.displayDate
-      : '';
+    dom.activePhotoDate.textContent =
+      activePhoto && activePhoto.displayDate ? activePhoto.displayDate : '';
   }
 
   function goToSlide(index) {
@@ -687,7 +553,10 @@
   function recordSurpriseId(id) {
     const recent = getRecentSurpriseIds().filter((existingId) => existingId !== id);
     recent.push(id);
-    const maxHistory = Math.max(10, Math.floor((state.allPhotos.length + state.allVideos.length) * 0.6));
+    const maxHistory = Math.max(
+      10,
+      Math.floor((state.allPhotos.length + state.allVideos.length) * 0.6)
+    );
     const trimmed = recent.slice(-maxHistory);
     localStorage.setItem(STORAGE_KEYS.RECENT_SURPRISE, JSON.stringify(trimmed));
   }
@@ -759,24 +628,10 @@
     startSlideshowTimer();
   }
 
-  function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
   // Event Listeners
   function bindEvents() {
     dom.signInBtn.addEventListener('click', triggerSignIn);
     dom.signOutBtn.addEventListener('click', signOut);
-    dom.changeFolderBtn.addEventListener('click', () => openFolderPicker());
-
-    dom.useIdBtn.addEventListener('click', handleFolderSearchOrOpen);
-    dom.folderSearchInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        handleFolderSearchOrOpen();
-      }
-    });
 
     dom.prevSlideBtn.addEventListener('click', () => goToSlide(state.currentSlideIndex - 1));
     dom.nextSlideBtn.addEventListener('click', () => goToSlide(state.currentSlideIndex + 1));
